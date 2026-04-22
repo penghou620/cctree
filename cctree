@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""
+cctree — visualize Claude Code /branch trees.
+
+Usage:
+  cctree                 # trees for sessions whose cwd matches $PWD
+  cctree --all           # trees across every project dir
+  cctree --path <dir>    # trees for a specific working dir
+  cctree --all-sessions  # include unbranched (leaf-only) sessions too
+
+Branch info comes from `forkedFrom` pointers in ~/.claude/projects/*/*.jsonl.
+"""
+import argparse
+import collections
+import glob
+import json
+import os
+import sys
+from datetime import datetime
+
+__version__ = "0.1.0"
+
+
+def extract_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                return b.get("text", "")
+    return ""
+
+
+def is_preamble(text: str) -> bool:
+    t = text.lstrip()
+    if not t:
+        return True
+    preambles = (
+        "<local-command-caveat>",
+        "<command-name>",
+        "<command-message>",
+        "<command-stdout>",
+        "<command-args>",
+        "<local-command-stdout>",
+        "You maintain a persistent memory system",
+        "Caveat: The messages below",
+    )
+    return any(t.startswith(p) for p in preambles)
+
+
+def scan_session(path):
+    """Return dict of { sessionId, cwd, forkedFrom, title, first, mtime } or None."""
+    sid = os.path.basename(path)[:-6]
+    parent = parent_msg = cwd = first = title = custom_title = None
+    try:
+        with open(path) as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                t = d.get("type")
+                if t == "custom-title" and d.get("customTitle"):
+                    ct = d["customTitle"]
+                    # Claude Code auto-generates "(Branch N)" titles from the first
+                    # user prompt — when that prompt is a preamble tag, the title
+                    # is junk. Discard so we fall back to parent inheritance.
+                    if not is_preamble(ct):
+                        custom_title = ct
+                elif t == "ai-title" and d.get("aiTitle"):
+                    title = d["aiTitle"]  # last one wins
+                if cwd is None and d.get("cwd"):
+                    cwd = d["cwd"]
+                if "forkedFrom" in d and parent is None:
+                    parent = d["forkedFrom"].get("sessionId")
+                    parent_msg = d["forkedFrom"].get("messageUuid")
+                if first is None and t == "user":
+                    msg = d.get("message", {}) or {}
+                    txt = extract_text(msg.get("content"))
+                    if txt and not is_preamble(txt):
+                        first = txt.strip().replace("\n", " ")
+    except Exception:
+        return None
+    return {
+        "sid": sid,
+        "cwd": cwd,
+        "parent": parent,
+        "parent_msg": parent_msg,
+        "title": custom_title or title,
+        "title_custom": bool(custom_title),
+        "first": first or "(no user prompt)",
+        "mtime": os.path.getmtime(path),
+    }
+
+
+def load_sessions():
+    out = {}
+    for f in glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")):
+        s = scan_session(f)
+        if s:
+            out[s["sid"]] = s
+    return out
+
+
+def color(s, c):
+    if not sys.stdout.isatty():
+        return s
+    codes = {"dim": "2", "cyan": "36", "yellow": "33", "green": "32", "bold": "1"}
+    return f"\x1b[{codes[c]}m{s}\x1b[0m"
+
+
+def render(sessions, roots, include_unbranched):
+    children = collections.defaultdict(list)
+    for s in sessions.values():
+        children[s["parent"]].append(s["sid"])
+    for sids in children.values():
+        sids.sort(key=lambda x: sessions[x]["mtime"])
+
+    # Inherit parent's title when child has none (a fork continues the thread).
+    for sid, s in sessions.items():
+        if s["title"]:
+            continue
+        cur = s["parent"]
+        while cur and cur in sessions:
+            if sessions[cur]["title"]:
+                s["title"] = sessions[cur]["title"]
+                s["inherited"] = True
+                break
+            cur = sessions[cur]["parent"]
+
+    def has_branch(sid):
+        kids = children.get(sid, [])
+        return bool(kids) or any(has_branch(k) for k in kids)
+
+    def walk(sid, prefix="", is_last=True):
+        s = sessions[sid]
+        connector = "└─ " if is_last else "├─ "
+        date = datetime.fromtimestamp(s["mtime"]).strftime("%m-%d %H:%M")
+        if s["title"]:
+            marker = "↑ " if s.get("inherited") else ""
+            label_colored = color((marker + s["title"])[:80], "green")
+        else:
+            label_colored = s["first"][:80]
+        line = (
+            prefix
+            + connector
+            + color(s["sid"][:8], "cyan")
+            + "  "
+            + color(date, "dim")
+            + "  "
+            + label_colored
+        )
+        print(line)
+        new_prefix = prefix + ("   " if is_last else "│  ")
+        kids = children.get(sid, [])
+        for i, c in enumerate(kids):
+            walk(c, new_prefix, i == len(kids) - 1)
+
+    shown = [r for r in roots if include_unbranched or has_branch(r)]
+    shown.sort(key=lambda x: sessions[x]["mtime"])
+    for i, r in enumerate(shown):
+        walk(r, "", i == len(shown) - 1)
+    if not shown:
+        print(color("(no branched sessions here — try --all-sessions or --all)", "dim"))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--version", action="version", version=f"cctree {__version__}")
+    ap.add_argument("--all", action="store_true", help="show every project dir")
+    ap.add_argument("--path", help="filter by cwd (default: $PWD)")
+    ap.add_argument(
+        "--all-sessions",
+        action="store_true",
+        help="include sessions that never branched",
+    )
+    args = ap.parse_args()
+
+    sessions = load_sessions()
+    if args.all:
+        groups = collections.defaultdict(dict)
+        for sid, s in sessions.items():
+            groups[s["cwd"] or "(unknown)"][sid] = s
+        for cwd in sorted(groups):
+            subset = groups[cwd]
+            roots = [s["sid"] for s in subset.values() if s["parent"] not in subset]
+            # render only groups with at least one branch
+            children = collections.defaultdict(list)
+            for s in subset.values():
+                children[s["parent"]].append(s["sid"])
+            if not args.all_sessions and not any(children.get(sid) for sid in subset):
+                continue
+            print(color(f"\n# {cwd}", "bold"))
+            render(subset, roots, args.all_sessions)
+    else:
+        target = os.path.abspath(args.path or os.getcwd())
+        subset = {sid: s for sid, s in sessions.items() if s["cwd"] == target}
+        if not subset:
+            print(color(f"No sessions found for cwd={target}", "yellow"))
+            print(color("Try: cctree --all", "dim"))
+            return
+        roots = [s["sid"] for s in subset.values() if s["parent"] not in subset]
+        print(color(f"# {target}", "bold"))
+        render(subset, roots, args.all_sessions)
+
+
+if __name__ == "__main__":
+    main()
