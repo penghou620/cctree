@@ -3,22 +3,28 @@
 cctree — visualize Claude Code /branch trees.
 
 Usage:
-  cctree                 # trees for sessions whose cwd matches $PWD
-  cctree --all           # trees across every project dir
-  cctree --path <dir>    # trees for a specific working dir
-  cctree --all-sessions  # include unbranched (leaf-only) sessions too
+  cctree                      # trees for sessions whose cwd matches $PWD
+  cctree --all                # trees across every project dir
+  cctree --path <dir>         # trees for a specific working dir
+  cctree --all-sessions       # include unbranched (leaf-only) sessions too
+  cctree --watch              # tmux-aware sidebar: follow the active pane
+  cctree --highlight <sid>    # render once, bold the given sessionId
 
 Branch info comes from `forkedFrom` pointers in ~/.claude/projects/*/*.jsonl.
+Active-session detection reads ~/.claude/sessions/<pid>.json and walks
+descendants of the focused tmux pane.
 """
 import argparse
 import collections
 import glob
 import json
 import os
+import subprocess
 import sys
+import time
 from datetime import datetime
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def extract_text(content):
@@ -109,7 +115,135 @@ def color(s, c):
     return f"\x1b[{codes[c]}m{s}\x1b[0m"
 
 
-def render(sessions, roots, include_unbranched):
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def running_claude_pid_to_session():
+    """pid -> sessionId for live Claude Code processes."""
+    out = {}
+    d = os.path.expanduser("~/.claude/sessions")
+    if not os.path.isdir(d):
+        return out
+    for f in os.listdir(d):
+        if not f.endswith(".json"):
+            continue
+        try:
+            pid = int(f[:-5])
+        except ValueError:
+            continue
+        if not pid_alive(pid):
+            continue
+        try:
+            data = json.load(open(os.path.join(d, f)))
+        except Exception:
+            continue
+        sid = data.get("sessionId")
+        if sid:
+            out[pid] = sid
+    return out
+
+
+def build_pid_children():
+    """ppid -> [child_pid]."""
+    children = collections.defaultdict(list)
+    try:
+        raw = subprocess.check_output(
+            ["ps", "-A", "-o", "pid=,ppid="], text=True
+        )
+    except Exception:
+        return children
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        children[ppid].append(pid)
+    return children
+
+
+def descendants(root_pid, children):
+    stack = [root_pid]
+    while stack:
+        p = stack.pop()
+        yield p
+        stack.extend(children.get(p, []))
+
+
+def tmux_focused_pane_pid(self_pane_id=None):
+    """Return pid of the focused pane in our tmux session, or None.
+
+    If the sidebar is itself the focused pane (user clicked into it), we still
+    return its pid — caller decides whether to skip based on self_pane_id.
+    """
+    if not os.environ.get("TMUX"):
+        return None
+    try:
+        ses = subprocess.check_output(
+            ["tmux", "display", "-p", "#{session_name}"], text=True
+        ).strip()
+        raw = subprocess.check_output(
+            ["tmux", "list-panes", "-s", "-t", ses, "-F",
+             "#{pane_id}|#{?window_active,1,0}|#{?pane_active,1,0}|#{pane_pid}"],
+            text=True,
+        )
+    except Exception:
+        return None
+    for line in raw.splitlines():
+        parts = line.split("|")
+        if len(parts) != 4:
+            continue
+        pane_id, win_active, pane_active, pid = parts
+        if win_active == "1" and pane_active == "1":
+            if self_pane_id and pane_id == self_pane_id:
+                return None  # sidebar is focused — no "other" active pane
+            try:
+                return int(pid)
+            except ValueError:
+                return None
+    return None
+
+
+def find_active_claude_session(self_pane_id=None):
+    """sessionId of the Claude running in the focused tmux pane, or None."""
+    pane_pid = tmux_focused_pane_pid(self_pane_id)
+    if not pane_pid:
+        return None
+    pid_to_sid = running_claude_pid_to_session()
+    if not pid_to_sid:
+        return None
+    children = build_pid_children()
+    for pid in descendants(pane_pid, children):
+        if pid in pid_to_sid:
+            return pid_to_sid[pid]
+    return None
+
+
+def cwd_for_session(sid):
+    """Return the cwd recorded for sessionId, by peeking its JSONL header."""
+    for f in glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sid}.jsonl")):
+        try:
+            with open(f) as fh:
+                for line in fh:
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    if d.get("cwd"):
+                        return d["cwd"]
+        except Exception:
+            pass
+    return None
+
+
+def render(sessions, roots, include_unbranched, active_sid=None):
     children = collections.defaultdict(list)
     for s in sessions.values():
         children[s["parent"]].append(s["sid"])
@@ -135,6 +269,8 @@ def render(sessions, roots, include_unbranched):
     def walk(sid, prefix="", is_last=True):
         s = sessions[sid]
         connector = "└─ " if is_last else "├─ "
+        is_active = active_sid and sid == active_sid
+        bullet = "● " if is_active else ""
         date = datetime.fromtimestamp(s["mtime"]).strftime("%m-%d %H:%M")
         if s["title"]:
             marker = "↑ " if s.get("inherited") else ""
@@ -144,12 +280,15 @@ def render(sessions, roots, include_unbranched):
         line = (
             prefix
             + connector
+            + bullet
             + color(s["sid"][:8], "cyan")
             + "  "
             + color(date, "dim")
             + "  "
             + label_colored
         )
+        if is_active and sys.stdout.isatty():
+            line = f"\x1b[1;7m{line}\x1b[0m"  # bold + reverse
         print(line)
         new_prefix = prefix + ("   " if is_last else "│  ")
         kids = children.get(sid, [])
@@ -164,6 +303,75 @@ def render(sessions, roots, include_unbranched):
         print(color("(no branched sessions here — try --all-sessions or --all)", "dim"))
 
 
+def render_for_scope(sessions, path_filter, include_unbranched, all_projects, active_sid):
+    """Render either a single project (path_filter) or all branched projects."""
+    if all_projects:
+        groups = collections.defaultdict(dict)
+        for sid, s in sessions.items():
+            groups[s["cwd"] or "(unknown)"][sid] = s
+        rendered_any = False
+        for cwd in sorted(groups):
+            subset = groups[cwd]
+            children = collections.defaultdict(list)
+            for s in subset.values():
+                children[s["parent"]].append(s["sid"])
+            if not include_unbranched and not any(children.get(sid) for sid in subset):
+                continue
+            roots = [s["sid"] for s in subset.values() if s["parent"] not in subset]
+            print(color(f"\n# {cwd}", "bold"))
+            render(subset, roots, include_unbranched, active_sid=active_sid)
+            rendered_any = True
+        if not rendered_any:
+            print(color("(no branched sessions anywhere)", "dim"))
+        return
+
+    target = os.path.abspath(path_filter)
+    subset = {sid: s for sid, s in sessions.items() if s["cwd"] == target}
+    if not subset:
+        print(color(f"No sessions found for cwd={target}", "yellow"))
+        print(color("Try: cctree --all", "dim"))
+        return
+    roots = [s["sid"] for s in subset.values() if s["parent"] not in subset]
+    print(color(f"# {target}", "bold"))
+    render(subset, roots, include_unbranched, active_sid=active_sid)
+
+
+def watch_loop(args):
+    self_pane_id = os.environ.get("TMUX_PANE")
+    interval = max(0.3, args.interval)
+    last_active = last_target = None
+    try:
+        while True:
+            active_sid = find_active_claude_session(self_pane_id)
+            # Scope to active session's cwd when available.
+            if active_sid:
+                target = cwd_for_session(active_sid) or (args.path or os.getcwd())
+            elif args.path:
+                target = args.path
+            else:
+                target = last_target or os.getcwd()
+            last_active, last_target = active_sid, target
+
+            sys.stdout.write("\x1b[2J\x1b[H")  # clear + home
+            ts = datetime.now().strftime("%H:%M:%S")
+            active_label = color(active_sid[:8], "green") if active_sid else color("(none)", "dim")
+            print(color(f"cctree {__version__}", "bold") + color(f"  {ts}  active: ", "dim") + active_label)
+            print()
+
+            sessions = load_sessions()
+            render_for_scope(
+                sessions,
+                path_filter=target,
+                include_unbranched=args.all_sessions,
+                all_projects=args.all,
+                active_sid=active_sid,
+            )
+            sys.stdout.flush()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", action="version", version=f"cctree {__version__}")
@@ -174,34 +382,43 @@ def main():
         action="store_true",
         help="include sessions that never branched",
     )
+    ap.add_argument(
+        "--watch",
+        action="store_true",
+        help="tmux-aware sidebar loop: follow the focused pane and highlight its claude",
+    )
+    ap.add_argument(
+        "--interval",
+        type=float,
+        default=1.0,
+        help="watch-mode refresh seconds (default: 1.0)",
+    )
+    ap.add_argument(
+        "--highlight",
+        metavar="SID",
+        help="render once and highlight the given session id (prefix match ok)",
+    )
     args = ap.parse_args()
 
+    if args.watch:
+        watch_loop(args)
+        return
+
     sessions = load_sessions()
-    if args.all:
-        groups = collections.defaultdict(dict)
-        for sid, s in sessions.items():
-            groups[s["cwd"] or "(unknown)"][sid] = s
-        for cwd in sorted(groups):
-            subset = groups[cwd]
-            roots = [s["sid"] for s in subset.values() if s["parent"] not in subset]
-            # render only groups with at least one branch
-            children = collections.defaultdict(list)
-            for s in subset.values():
-                children[s["parent"]].append(s["sid"])
-            if not args.all_sessions and not any(children.get(sid) for sid in subset):
-                continue
-            print(color(f"\n# {cwd}", "bold"))
-            render(subset, roots, args.all_sessions)
-    else:
-        target = os.path.abspath(args.path or os.getcwd())
-        subset = {sid: s for sid, s in sessions.items() if s["cwd"] == target}
-        if not subset:
-            print(color(f"No sessions found for cwd={target}", "yellow"))
-            print(color("Try: cctree --all", "dim"))
-            return
-        roots = [s["sid"] for s in subset.values() if s["parent"] not in subset]
-        print(color(f"# {target}", "bold"))
-        render(subset, roots, args.all_sessions)
+
+    active_sid = None
+    if args.highlight:
+        # Allow prefix match for convenience.
+        matches = [sid for sid in sessions if sid.startswith(args.highlight)]
+        active_sid = matches[0] if matches else args.highlight
+
+    render_for_scope(
+        sessions,
+        path_filter=args.path or os.getcwd(),
+        include_unbranched=args.all_sessions,
+        all_projects=args.all,
+        active_sid=active_sid,
+    )
 
 
 if __name__ == "__main__":
