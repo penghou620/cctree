@@ -12,7 +12,7 @@ if [ -z "${TMUX:-}" ]; then
   exit 1
 fi
 
-WIDTH="${CCTREE_SIDEBAR_WIDTH:-70}"
+WIDTH="${CCTREE_SIDEBAR_WIDTH:-47}"
 CMD="${CCTREE_SIDEBAR_CMD:-cctree --watch}"
 
 existing=$(tmux show-options -wqv @cctree_pane 2>/dev/null || true)
