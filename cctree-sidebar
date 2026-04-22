@@ -23,6 +23,6 @@ if [ -n "$existing" ] && tmux list-panes -F '#{pane_id}' | grep -qx "$existing";
   exit 0
 fi
 
-new_pane=$(tmux split-window -h -l "$WIDTH" -d -P -F '#{pane_id}' "$CMD")
+new_pane=$(tmux split-window -fhb -l "$WIDTH" -d -P -F '#{pane_id}' "$CMD")
 tmux select-pane -t "$new_pane" -T cctree
 tmux set-option -w @cctree_pane "$new_pane" >/dev/null
