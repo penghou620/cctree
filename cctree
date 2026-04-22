@@ -235,6 +235,25 @@ def find_active_claude_session(self_pane_id=None):
     return None
 
 
+def _term_width():
+    try:
+        import shutil
+        return shutil.get_terminal_size((80, 24)).columns
+    except Exception:
+        return 80
+
+
+def _truncate(text, width):
+    """Truncate plain text to visual width; add … if trimmed."""
+    if width < 1:
+        return ""
+    if len(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    return text[: width - 1] + "…"
+
+
 def cwd_for_session(sid):
     """Return the cwd recorded for sessionId, by peeking its JSONL header."""
     for f in glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sid}.jsonl")):
@@ -280,22 +299,33 @@ def render(sessions, roots, include_unbranched, active_sid=None):
             return True
         return any(contains_active(k) for k in children.get(sid, []))
 
+    width = _term_width()
+
     def walk(sid, prefix="", is_last=True):
         s = sessions[sid]
         connector = "└─ " if is_last else "├─ "
         is_active = active_sid and sid == active_sid
         bullet = "● " if is_active else ""
         date = datetime.fromtimestamp(s["mtime"]).strftime("%m-%d %H:%M")
+        sid_short = s["sid"][:8]
+
+        # Build a plain (no-ANSI) version of the fixed-width lead to measure
+        # how much room the label has before it would wrap.
+        head_plain = prefix + connector + bullet + sid_short + "  " + date + "  "
+        avail = max(1, width - len(head_plain))
+
         if s["title"]:
             marker = "↑ " if s.get("inherited") else ""
-            label_colored = color((marker + s["title"])[:80], "green")
+            label_plain = marker + s["title"]
+            label_colored = color(_truncate(label_plain, avail), "green")
         else:
-            label_colored = s["first"][:80]
+            label_colored = _truncate(s["first"], avail)
+
         line = (
             prefix
             + connector
             + bullet
-            + color(s["sid"][:8], "cyan")
+            + color(sid_short, "cyan")
             + "  "
             + color(date, "dim")
             + "  "
@@ -334,7 +364,7 @@ def render_for_scope(sessions, path_filter, include_unbranched, all_projects, ac
             if not include_unbranched and not has_any_branch and not has_active:
                 continue
             roots = [s["sid"] for s in subset.values() if s["parent"] not in subset]
-            print(color(f"\n# {cwd}", "bold"))
+            print(color(_truncate(f"\n# {cwd}", _term_width() + 1), "bold"))
             render(subset, roots, include_unbranched, active_sid=active_sid)
             rendered_any = True
         if not rendered_any:
@@ -348,7 +378,7 @@ def render_for_scope(sessions, path_filter, include_unbranched, all_projects, ac
         print(color("Try: cctree --all", "dim"))
         return
     roots = [s["sid"] for s in subset.values() if s["parent"] not in subset]
-    print(color(f"# {target}", "bold"))
+    print(color(_truncate(f"# {target}", _term_width()), "bold"))
     render(subset, roots, include_unbranched, active_sid=active_sid)
 
 
