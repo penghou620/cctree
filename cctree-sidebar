@@ -1,0 +1,28 @@
+#!/bin/bash
+# cctree-sidebar — toggle a `cctree --watch` pane in the current tmux window.
+#
+# Remembers the sidebar pane id in a window-local tmux option (@cctree_pane).
+# On re-trigger, kills the existing pane; otherwise creates a new right-hand
+# split without stealing focus.
+
+set -euo pipefail
+
+if [ -z "${TMUX:-}" ]; then
+  echo "cctree-sidebar: not running inside tmux" >&2
+  exit 1
+fi
+
+WIDTH="${CCTREE_SIDEBAR_WIDTH:-70}"
+CMD="${CCTREE_SIDEBAR_CMD:-cctree --watch}"
+
+existing=$(tmux show-options -wqv @cctree_pane 2>/dev/null || true)
+
+if [ -n "$existing" ] && tmux list-panes -F '#{pane_id}' | grep -qx "$existing"; then
+  tmux kill-pane -t "$existing"
+  tmux set-option -uw @cctree_pane >/dev/null
+  exit 0
+fi
+
+new_pane=$(tmux split-window -h -l "$WIDTH" -d -P -F '#{pane_id}' "$CMD")
+tmux select-pane -t "$new_pane" -T cctree
+tmux set-option -w @cctree_pane "$new_pane" >/dev/null
