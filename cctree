@@ -108,8 +108,17 @@ def load_sessions():
     return out
 
 
+def _color_on():
+    # Check fd 1 directly so colors still fire when sys.stdout is redirected
+    # to a buffer (watch mode renders into StringIO before flushing).
+    try:
+        return os.isatty(1)
+    except Exception:
+        return False
+
+
 def color(s, c):
-    if not sys.stdout.isatty():
+    if not _color_on():
         return s
     codes = {"dim": "2", "cyan": "36", "yellow": "33", "green": "32", "bold": "1"}
     return f"\x1b[{codes[c]}m{s}\x1b[0m"
@@ -292,7 +301,7 @@ def render(sessions, roots, include_unbranched, active_sid=None):
             + "  "
             + label_colored
         )
-        if is_active and sys.stdout.isatty():
+        if is_active and _color_on():
             line = f"\x1b[1;7m{line}\x1b[0m"  # bold + reverse
         print(line)
         new_prefix = prefix + ("   " if is_last else "│  ")
@@ -344,39 +353,65 @@ def render_for_scope(sessions, path_filter, include_unbranched, all_projects, ac
 
 
 def watch_loop(args):
+    import io
+    import contextlib
+
     self_pane_id = os.environ.get("TMUX_PANE")
     interval = max(0.3, args.interval)
-    last_active = last_target = None
+    last_target = None
+    use_alt = _color_on()
+
+    if use_alt:
+        # Enter alt screen + hide cursor so the sidebar doesn't pollute scrollback
+        # and the caret doesn't flicker on every redraw.
+        sys.stdout.write("\x1b[?1049h\x1b[?25l")
+        sys.stdout.flush()
     try:
         while True:
             active_sid = find_active_claude_session(self_pane_id)
-            # Scope to active session's cwd when available.
             if active_sid:
                 target = cwd_for_session(active_sid) or (args.path or os.getcwd())
             elif args.path:
                 target = args.path
             else:
                 target = last_target or os.getcwd()
-            last_active, last_target = active_sid, target
+            last_target = target
 
-            sys.stdout.write("\x1b[2J\x1b[H")  # clear + home
-            ts = datetime.now().strftime("%H:%M:%S")
-            active_label = color(active_sid[:8], "green") if active_sid else color("(none)", "dim")
-            print(color(f"cctree {__version__}", "bold") + color(f"  {ts}  active: ", "dim") + active_label)
-            print()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ts = datetime.now().strftime("%H:%M:%S")
+                active_label = (
+                    color(active_sid[:8], "green") if active_sid else color("(none)", "dim")
+                )
+                print(
+                    color(f"cctree {__version__}", "bold")
+                    + color(f"  {ts}  active: ", "dim")
+                    + active_label
+                )
+                print()
+                sessions = load_sessions()
+                render_for_scope(
+                    sessions,
+                    path_filter=target,
+                    include_unbranched=args.all_sessions,
+                    all_projects=args.all,
+                    active_sid=active_sid,
+                )
 
-            sessions = load_sessions()
-            render_for_scope(
-                sessions,
-                path_filter=target,
-                include_unbranched=args.all_sessions,
-                all_projects=args.all,
-                active_sid=active_sid,
-            )
+            # In-place redraw: home, then each line clears to end-of-line
+            # before its newline; finally clear any leftover rows below.
+            # Single write keeps the frame visually atomic → no flicker.
+            lines = buf.getvalue().rstrip("\n").split("\n")
+            frame = "\x1b[H" + "\n".join(line + "\x1b[K" for line in lines) + "\x1b[J"
+            sys.stdout.write(frame)
             sys.stdout.flush()
             time.sleep(interval)
     except KeyboardInterrupt:
         pass
+    finally:
+        if use_alt:
+            sys.stdout.write("\x1b[?25h\x1b[?1049l")
+            sys.stdout.flush()
 
 
 def main():
