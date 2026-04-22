@@ -312,12 +312,21 @@ def render(sessions, roots, include_unbranched, active_sid=None):
         # Reserve room for a 2-space gap + date on the right.
         avail_for_label = max(1, width - len(head_plain) - 2 - len(date))
 
+        sid_short = s["sid"][:8]
         if s["title"]:
             marker = "↑ " if s.get("inherited") else ""
-            label_plain = _truncate(marker + s["title"], avail_for_label)
-            label_colored = color(label_plain, "green")
+            # Reserve room for " (xxxxxxxx)" after the title; drop the suffix
+            # if the terminal is too narrow to fit anything useful.
+            suffix_len = len(sid_short) + 3  # " (" + sid + ")"
+            if avail_for_label - suffix_len >= 4:
+                title_plain = _truncate(marker + s["title"], avail_for_label - suffix_len)
+                label_plain = f"{title_plain} ({sid_short})"
+                label_colored = color(title_plain, "green") + color(f" ({sid_short})", "dim")
+            else:
+                label_plain = _truncate(marker + s["title"], avail_for_label)
+                label_colored = color(label_plain, "green")
         else:
-            label_plain = _truncate(s["sid"][:8], avail_for_label)
+            label_plain = _truncate(sid_short, avail_for_label)
             label_colored = color(label_plain, "cyan")
 
         # Pad between label and date so date right-aligns to the terminal edge.
