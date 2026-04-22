@@ -62,6 +62,21 @@ case ":$PATH:" in
      ;;
 esac
 
+# Slash commands (~/.claude/commands/{up,down}.md)
+CMD_DIR="$HOME/.claude/commands"
+mkdir -p "$CMD_DIR"
+for name in up down; do
+  src="$INSTALL_DIR/commands/$name.md"
+  dst="$CMD_DIR/$name.md"
+  if [ ! -f "$src" ]; then continue; fi
+  if [ -e "$dst" ] && ! cmp -s "$src" "$dst"; then
+    warn "$dst exists and differs — leaving yours in place (remove it to take the new version)"
+    continue
+  fi
+  cp "$src" "$dst"
+  info "installed slash command /$name"
+done
+
 # Tmux binding
 mode="${CCTREE_INSTALL_TMUX_BINDING:-ask}"
 if [ "$mode" = "ask" ]; then

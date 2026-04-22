@@ -51,6 +51,23 @@ cctree --version
 - Untitled sessions fall back to their 8-char sid.
 - Dates are right-aligned and reflect the session's last-modified time.
 
+## Traverse the tree from inside Claude Code
+
+Two slash commands are installed into `~/.claude/commands/`:
+
+- **`/up`** — show the parent of the current session (the one `/branch` forked from)
+- **`/down`** — list the children (sessions forked from this one)
+
+Each prints a ready-to-copy `claude --resume <sid>` line. Because Claude Code can't swap sessions mid-conversation, you `/exit` and paste the command to actually move. The underlying subcommands work standalone too:
+
+```bash
+cctree --self     # sessionId of the enclosing claude process
+cctree --up       # parent of current session
+cctree --down     # children of current session
+cctree --up   --sid 1e8801aa   # inspect any session by prefix
+cctree --down --sid 1e8801aa
+```
+
 ## Tmux sidebar
 
 `cctree-sidebar` toggles a full-height 47-col pane on the left of the current tmux window running `cctree --watch`. Bind it in `~/.tmux.conf`:

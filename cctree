@@ -235,6 +235,98 @@ def find_active_claude_session(self_pane_id=None):
     return None
 
 
+def _parent_pid(pid):
+    try:
+        out = subprocess.check_output(
+            ["ps", "-o", "ppid=", "-p", str(pid)], text=True, stderr=subprocess.DEVNULL
+        )
+        return int(out.strip())
+    except Exception:
+        return None
+
+
+def detect_self_session():
+    """Walk up from our own PID looking for an ancestor that has a live
+    ~/.claude/sessions/<pid>.json file. Returns sessionId or None."""
+    pid_to_sid = running_claude_pid_to_session()
+    if not pid_to_sid:
+        return None
+    cur = os.getpid()
+    seen = set()
+    while cur and cur > 1 and cur not in seen:
+        seen.add(cur)
+        if cur in pid_to_sid:
+            return pid_to_sid[cur]
+        cur = _parent_pid(cur)
+    return None
+
+
+def _fmt_row(sid, sessions):
+    s = sessions.get(sid)
+    if not s:
+        return f"{sid[:8]}  (not on disk)"
+    title = s["title"] or "(untitled)"
+    date = datetime.fromtimestamp(s["mtime"]).strftime("%m-%d %H:%M")
+    return f"{color(sid[:8], 'cyan')}  {color(date, 'dim')}  {color(title, 'green') if s['title'] else title}"
+
+
+def cmd_traverse(direction, sid_arg):
+    """direction: 'up' | 'down' | 'self'"""
+    sessions = load_sessions()
+
+    start = sid_arg or detect_self_session()
+    if not start:
+        print(
+            "cctree: could not detect current session. Pass --sid <prefix> "
+            "(are you running this from inside a claude session?)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # prefix match against loaded sessions
+    full = start if start in sessions else next(
+        (s for s in sessions if s.startswith(start)), start
+    )
+
+    if direction == "self":
+        print(full)
+        return
+
+    cur_row = _fmt_row(full, sessions)
+    print(f"Current:  {cur_row}")
+
+    s = sessions.get(full)
+    if direction == "up":
+        parent = s["parent"] if s else None
+        if not parent:
+            print(color("  (no parent — this is a root session)", "dim"))
+            return
+        print(f"Parent:   {_fmt_row(parent, sessions)}")
+        print()
+        print("To resume parent:")
+        print(f"  claude --resume {parent}")
+        return
+
+    # down
+    kids = sorted(
+        (c for c in sessions.values() if c["parent"] == full),
+        key=lambda c: c["mtime"],
+    )
+    if not kids:
+        print(color("  (no children — this is a leaf session)", "dim"))
+        return
+    print(f"Children ({len(kids)}):")
+    for i, c in enumerate(kids, 1):
+        print(f"  [{i}] {_fmt_row(c['sid'], sessions)}")
+    print()
+    if len(kids) == 1:
+        print("To resume child:")
+        print(f"  claude --resume {kids[0]['sid']}")
+    else:
+        print("To resume a child:")
+        print("  claude --resume <sid from the list above>")
+
+
 def _term_width():
     try:
         import shutil
@@ -473,8 +565,25 @@ def main():
         metavar="SID",
         help="render once and highlight the given session id (prefix match ok)",
     )
+    ap.add_argument("--self", dest="show_self", action="store_true",
+                    help="print the sessionId of the enclosing claude process")
+    ap.add_argument("--up", action="store_true",
+                    help="show the parent of the current (or --sid) session")
+    ap.add_argument("--down", action="store_true",
+                    help="show the children of the current (or --sid) session")
+    ap.add_argument("--sid", metavar="SID",
+                    help="override which session to traverse from (prefix ok)")
     args = ap.parse_args()
 
+    if args.show_self:
+        cmd_traverse("self", args.sid)
+        return
+    if args.up:
+        cmd_traverse("up", args.sid)
+        return
+    if args.down:
+        cmd_traverse("down", args.sid)
+        return
     if args.watch:
         watch_loop(args)
         return
