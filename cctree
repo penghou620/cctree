@@ -317,8 +317,8 @@ def render(sessions, roots, include_unbranched, active_sid=None):
             label_plain = _truncate(marker + s["title"], avail_for_label)
             label_colored = color(label_plain, "green")
         else:
-            label_plain = _truncate(s["first"], avail_for_label)
-            label_colored = label_plain
+            label_plain = _truncate(s["sid"][:8], avail_for_label)
+            label_colored = color(label_plain, "cyan")
 
         # Pad between label and date so date right-aligns to the terminal edge.
         content_len = len(head_plain) + len(label_plain)
