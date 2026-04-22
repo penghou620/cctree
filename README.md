@@ -2,15 +2,7 @@
 
 Visualize [Claude Code](https://claude.com/claude-code) `/branch` session trees in your terminal, with an optional tmux sidebar that highlights the active session in your focused pane.
 
-```
-# /Users/sam/Code/my-app
-├─ feature/auth-rewrite             04-23 11:15
-│  ├─ postgres native roles         04-23 11:40
-│  │  └─ ● add rls tests            04-23 12:10
-│  └─ reconcile with middleware     04-23 12:50
-└─ bugfix/retry-jitter              04-23 13:05
-   └─ cap backoff at 30s            04-23 13:30
-```
+![cctree screenshot](assets/screenshot.svg)
 
 Claude Code doesn't ship a built-in way to see the tree of sessions you've forked with `/branch`. `cctree` reconstructs it by reading `~/.claude/projects/*/*.jsonl` (each fork records a `forkedFrom: {sessionId, messageUuid}` pointer) and renders it.
 
