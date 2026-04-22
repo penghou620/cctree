@@ -16,8 +16,24 @@ Claude Code doesn't ship a built-in way to see the tree of sessions you've forke
 
 ## Install
 
+One-liner:
+
 ```bash
-git clone git@github.com:penghou620/cctree.git ~/Projects/cctree
+curl -fsSL https://raw.githubusercontent.com/penghou620/cctree/main/install.sh | bash
+```
+
+This clones the repo to `~/.local/share/cctree` and symlinks `cctree` and `cctree-sidebar` into `~/.local/bin`. Re-running updates to the latest commit. If stdin is a tty it also offers to append the `prefix + C-c` tmux binding to `~/.tmux.conf`.
+
+Env overrides:
+
+- `CCTREE_INSTALL_DIR`          — where to clone the repo (default `~/.local/share/cctree`)
+- `CCTREE_BIN_DIR`              — where to symlink binaries (default `~/.local/bin`)
+- `CCTREE_INSTALL_TMUX_BINDING` — `yes` / `no` / `ask` (default: `ask` on tty, else `no`)
+
+Or do it manually:
+
+```bash
+git clone https://github.com/penghou620/cctree.git ~/Projects/cctree
 ln -s ~/Projects/cctree/cctree         ~/.local/bin/cctree
 ln -s ~/Projects/cctree/cctree-sidebar ~/.local/bin/cctree-sidebar
 ```
