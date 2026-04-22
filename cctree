@@ -266,6 +266,11 @@ def render(sessions, roots, include_unbranched, active_sid=None):
         kids = children.get(sid, [])
         return bool(kids) or any(has_branch(k) for k in kids)
 
+    def contains_active(sid):
+        if active_sid and sid == active_sid:
+            return True
+        return any(contains_active(k) for k in children.get(sid, []))
+
     def walk(sid, prefix="", is_last=True):
         s = sessions[sid]
         connector = "└─ " if is_last else "├─ "
@@ -295,7 +300,7 @@ def render(sessions, roots, include_unbranched, active_sid=None):
         for i, c in enumerate(kids):
             walk(c, new_prefix, i == len(kids) - 1)
 
-    shown = [r for r in roots if include_unbranched or has_branch(r)]
+    shown = [r for r in roots if include_unbranched or has_branch(r) or contains_active(r)]
     shown.sort(key=lambda x: sessions[x]["mtime"])
     for i, r in enumerate(shown):
         walk(r, "", i == len(shown) - 1)
@@ -315,7 +320,9 @@ def render_for_scope(sessions, path_filter, include_unbranched, all_projects, ac
             children = collections.defaultdict(list)
             for s in subset.values():
                 children[s["parent"]].append(s["sid"])
-            if not include_unbranched and not any(children.get(sid) for sid in subset):
+            has_any_branch = any(children.get(sid) for sid in subset)
+            has_active = active_sid and active_sid in subset
+            if not include_unbranched and not has_any_branch and not has_active:
                 continue
             roots = [s["sid"] for s in subset.values() if s["parent"] not in subset]
             print(color(f"\n# {cwd}", "bold"))
