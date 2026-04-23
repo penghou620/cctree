@@ -292,33 +292,65 @@ def _spawn_resumed(target_sid, label):
 
 def _pane_swap_loop(pane, target_sid):
     """Background helper: wait for the pane to stop changing (i.e. claude
-    finished its response), then exit claude and resume target_sid in place."""
+    finished its response), then exit claude and resume target_sid in place.
+
+    Logs to ~/.claude/cctree-pane-swap.log so mis-fires are diagnosable.
+    """
+    import shlex
+    log_path = os.path.expanduser("~/.claude/cctree-pane-swap.log")
+
+    def log(msg):
+        try:
+            with open(log_path, "a") as f:
+                f.write(
+                    f"{datetime.now().isoformat()} pane={pane} "
+                    f"target={target_sid[:8]} {msg}\n"
+                )
+        except Exception:
+            pass
+
+    log("start")
     prev = None
     stable = 0
-    # Cap total wait so we don't hang forever if the pane keeps changing.
     deadline = time.time() + 60
+    hit_stable = False
     while time.time() < deadline:
         try:
             cur = subprocess.check_output(
                 ["tmux", "capture-pane", "-p", "-t", pane], text=True
             )
-        except Exception:
+        except Exception as e:
+            log(f"capture failed: {e}")
             return
         if cur == prev:
             stable += 1
-            if stable >= 4:  # ~2s of no change → claude is idle
+            if stable >= 6:  # 3s of unchanged pane → claude is idle
+                hit_stable = True
                 break
         else:
             stable = 0
         prev = cur
         time.sleep(0.5)
-    # Quit claude, wait for the shell prompt, then launch the new session.
+    if not hit_stable:
+        log("deadline reached without stability; swapping anyway")
+    else:
+        log(f"pane stable after {stable} captures")
+
+    log("send /exit")
     subprocess.run(["tmux", "send-keys", "-t", pane, "/exit", "Enter"])
-    time.sleep(1.5)
-    subprocess.run(
-        ["tmux", "send-keys", "-t", pane,
-         f"claude --resume {target_sid}", "Enter"]
-    )
+    time.sleep(2.0)  # wait for claude to actually exit + shell prompt to return
+
+    # cd to the session's recorded cwd first so `claude --resume` resolves
+    # against the right project — otherwise claude may start a fresh session
+    # when the parent lives in a different project dir.
+    cwd = cwd_for_session(target_sid)
+    if cwd:
+        cmd = f"cd {shlex.quote(cwd)} && claude --resume {target_sid}"
+    else:
+        cmd = f"claude --resume {target_sid}"
+    log(f"send: {cmd}")
+    subprocess.run(["tmux", "send-keys", "-t", pane, cmd, "Enter"])
+    log("done")
 
 
 def _jump_inplace(target_sid, label):
