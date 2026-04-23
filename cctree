@@ -336,8 +336,14 @@ def _pane_swap_loop(pane, target_sid):
     else:
         log(f"pane stable after {stable} captures")
 
-    log("send /exit")
-    subprocess.run(["tmux", "send-keys", "-t", pane, "/exit", "Enter"])
+    # `/exit` typed via send-keys doesn't reliably trigger claude's slash-command
+    # handler (seems the input-box state doesn't always intercept the keys).
+    # Claude Code's TUI exits on Ctrl-C Ctrl-C, which works from any state —
+    # first C-c cancels in-flight work, second C-c quits the process.
+    log("send C-c C-c")
+    subprocess.run(["tmux", "send-keys", "-t", pane, "C-c"])
+    time.sleep(0.4)
+    subprocess.run(["tmux", "send-keys", "-t", pane, "C-c"])
     time.sleep(2.0)  # wait for claude to actually exit + shell prompt to return
 
     # cd to the session's recorded cwd first so `claude --resume` resolves
