@@ -5,4 +5,4 @@ allowed-tools: Bash(cctree:*)
 
 !`cctree --up --jump-inplace`
 
-Display the output above verbatim to the user. Do not summarize, comment, or add analysis. The swap fires after the current response finishes streaming; if --jump-inplace can't run (e.g. not in tmux), the printed `claude --resume …` line is the manual fallback.
+Display the output above verbatim to the user. Do not summarize, comment, or add analysis. The `[HH:MM:SS]` timestamp in the "pane swap queued" line marks the moment the swap was requested — on a replayed session (resumed from history), the timestamp will be old and no new swap fires. If `--jump-inplace` can't run (e.g. not in tmux), the printed `claude --resume …` line is the manual fallback.

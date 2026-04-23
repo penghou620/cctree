@@ -425,10 +425,16 @@ def _jump_inplace(target_sid, label):
     except Exception as e:
         print(color(f"\nfailed to spawn helper: {e}", "yellow"))
         return False
+    # Include the wall-clock time so a *replayed* /up (from session history
+    # re-rendered after a resume) is visually distinguishable from a fresh
+    # invocation: on replay the timestamp is old, and no helper is actually
+    # running. Claude Code does not re-execute Bash tool calls on resume,
+    # so the replayed line is text-only — no swap fires. Timestamping makes
+    # that unambiguous instead of looking like the swap hung.
+    ts = datetime.now().strftime("%H:%M:%S")
     print()
     print(color(
-        f"→ swapping to {label} ({target_sid[:8]}) in this pane "
-        f"once the current response finishes…",
+        f"→ [{ts}] pane swap queued → {label} ({target_sid[:8]})",
         "green",
     ))
     return True
