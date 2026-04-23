@@ -270,7 +270,27 @@ def _fmt_row(sid, sessions):
     return f"{color(sid[:8], 'cyan')}  {color(date, 'dim')}  {color(title, 'green') if s['title'] else title}"
 
 
-def cmd_traverse(direction, sid_arg):
+def _spawn_resumed(target_sid, label):
+    """Open a new tmux pane running `claude --resume target_sid`. Returns True
+    on success (in tmux) or False if not in tmux / spawn failed."""
+    if not os.environ.get("TMUX"):
+        print()
+        print(color("(--jump needs tmux to open a new pane)", "dim"))
+        return False
+    try:
+        subprocess.run(
+            ["tmux", "split-window", "-h", f"claude --resume {target_sid}"],
+            check=True,
+        )
+    except Exception as e:
+        print(color(f"\nfailed to open tmux pane: {e}", "yellow"))
+        return False
+    print()
+    print(color(f"→ opened {label} ({target_sid[:8]}) in a new tmux pane", "green"))
+    return True
+
+
+def cmd_traverse(direction, sid_arg, jump=False):
     """direction: 'up' | 'down' | 'self'"""
     sessions = load_sessions()
 
@@ -302,6 +322,9 @@ def cmd_traverse(direction, sid_arg):
             print(color("  (no parent — this is a root session)", "dim"))
             return
         print(f"Parent:   {_fmt_row(parent, sessions)}")
+        if jump:
+            if _spawn_resumed(parent, "parent"):
+                return
         print()
         print("To resume parent:")
         print(f"  claude --resume {parent}")
@@ -314,6 +337,15 @@ def cmd_traverse(direction, sid_arg):
     )
     if not kids:
         print(color("  (no children — this is a leaf session)", "dim"))
+        return
+    if jump and len(kids) == 1:
+        kid = kids[0]
+        print(f"Child:    {_fmt_row(kid['sid'], sessions)}")
+        if _spawn_resumed(kid["sid"], "child"):
+            return
+        print()
+        print("To resume child:")
+        print(f"  claude --resume {kid['sid']}")
         return
     print(f"Children ({len(kids)}):")
     for i, c in enumerate(kids, 1):
@@ -573,16 +605,18 @@ def main():
                     help="show the children of the current (or --sid) session")
     ap.add_argument("--sid", metavar="SID",
                     help="override which session to traverse from (prefix ok)")
+    ap.add_argument("--jump", action="store_true",
+                    help="open the resumed session in a new tmux pane (with --up/--down)")
     args = ap.parse_args()
 
     if args.show_self:
         cmd_traverse("self", args.sid)
         return
     if args.up:
-        cmd_traverse("up", args.sid)
+        cmd_traverse("up", args.sid, jump=args.jump)
         return
     if args.down:
-        cmd_traverse("down", args.sid)
+        cmd_traverse("down", args.sid, jump=args.jump)
         return
     if args.watch:
         watch_loop(args)

@@ -1,8 +1,8 @@
 ---
-description: Show the parent of the current /branch session (the one this was forked from)
+description: Open the parent of the current /branch session in a new tmux pane
 allowed-tools: Bash(cctree:*)
 ---
 
-!`cctree --up`
+!`cctree --up --jump`
 
-Display the output above verbatim to the user. Do not summarize, comment, or add analysis. If the user asks to actually switch to that session, instruct them to run `/exit` and then the `claude --resume …` line shown.
+Display the output above verbatim to the user. Do not summarize, comment, or add analysis. If the spawn failed (no tmux, etc.), the output already includes a `claude --resume …` line the user can run manually after `/exit`.

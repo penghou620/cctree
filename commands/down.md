@@ -1,8 +1,8 @@
 ---
-description: Show the /branch children of the current session (sessions forked from here)
+description: Open the /branch child of the current session in a new tmux pane (or list if multiple)
 allowed-tools: Bash(cctree:*)
 ---
 
-!`cctree --down`
+!`cctree --down --jump`
 
-Display the output above verbatim to the user. Do not summarize, comment, or add analysis. If the user asks to actually switch to one of those sessions, instruct them to run `/exit` and then the `claude --resume <sid>` line using the sid they want.
+Display the output above verbatim to the user. Do not summarize, comment, or add analysis. If there are multiple children, the output lists them and the user must rerun with the specific sid (or `/exit` and `claude --resume <sid>` manually).
