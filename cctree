@@ -132,8 +132,54 @@ def pid_alive(pid):
         return False
 
 
+_UUID_RE = None
+
+
+def _conversation_sid_from_cmdline(pid):
+    """If pid was started via `claude --resume <sid>` / `-r <sid>` /
+    `--session-id <sid>`, return that sid. Otherwise None.
+
+    Rationale: `~/.claude/sessions/<pid>.json`'s sessionId is the
+    peer-protocol id, which is a fresh UUID on every resume — *not* the
+    conversation sid the user cares about. The conversation sid is the
+    one the user passed on the command line.
+    """
+    global _UUID_RE
+    if _UUID_RE is None:
+        import re
+        _UUID_RE = re.compile(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+        )
+    try:
+        cmd = subprocess.check_output(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
+    # Tokens like: claude --resume <uuid>, claude -r <uuid>, --session-id <uuid>
+    tokens = cmd.split()
+    for i, tok in enumerate(tokens):
+        if tok in ("--resume", "-r", "--session-id") and i + 1 < len(tokens):
+            m = _UUID_RE.fullmatch(tokens[i + 1])
+            if m:
+                return tokens[i + 1]
+        if tok.startswith("--resume=") or tok.startswith("--session-id="):
+            val = tok.split("=", 1)[1]
+            if _UUID_RE.fullmatch(val):
+                return val
+    return None
+
+
 def running_claude_pid_to_session():
-    """pid -> sessionId for live Claude Code processes."""
+    """pid -> conversation sessionId for live Claude Code processes.
+
+    Prefer the sid from the process cmdline (claude --resume <sid>) over
+    the peer sid recorded in ~/.claude/sessions/<pid>.json — the latter is
+    a fresh UUID for every resume, so using it makes /up and /down look
+    like they landed in a "new" session when they actually resumed the
+    correct one.
+    """
     out = {}
     d = os.path.expanduser("~/.claude/sessions")
     if not os.path.isdir(d):
@@ -147,11 +193,13 @@ def running_claude_pid_to_session():
             continue
         if not pid_alive(pid):
             continue
-        try:
-            data = json.load(open(os.path.join(d, f)))
-        except Exception:
-            continue
-        sid = data.get("sessionId")
+        sid = _conversation_sid_from_cmdline(pid)
+        if not sid:
+            try:
+                data = json.load(open(os.path.join(d, f)))
+            except Exception:
+                continue
+            sid = data.get("sessionId")
         if sid:
             out[pid] = sid
     return out
