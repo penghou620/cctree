@@ -290,7 +290,65 @@ def _spawn_resumed(target_sid, label):
     return True
 
 
-def cmd_traverse(direction, sid_arg, jump=False):
+def _pane_swap_loop(pane, target_sid):
+    """Background helper: wait for the pane to stop changing (i.e. claude
+    finished its response), then exit claude and resume target_sid in place."""
+    prev = None
+    stable = 0
+    # Cap total wait so we don't hang forever if the pane keeps changing.
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        try:
+            cur = subprocess.check_output(
+                ["tmux", "capture-pane", "-p", "-t", pane], text=True
+            )
+        except Exception:
+            return
+        if cur == prev:
+            stable += 1
+            if stable >= 4:  # ~2s of no change → claude is idle
+                break
+        else:
+            stable = 0
+        prev = cur
+        time.sleep(0.5)
+    # Quit claude, wait for the shell prompt, then launch the new session.
+    subprocess.run(["tmux", "send-keys", "-t", pane, "/exit", "Enter"])
+    time.sleep(1.5)
+    subprocess.run(
+        ["tmux", "send-keys", "-t", pane,
+         f"claude --resume {target_sid}", "Enter"]
+    )
+
+
+def _jump_inplace(target_sid, label):
+    """Schedule an in-place pane swap to target_sid via a detached helper."""
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        print()
+        print(color("(--jump-inplace needs tmux)", "dim"))
+        return False
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__),
+             "--pane-swap", "--pane", pane, "--target", target_sid],
+            start_new_session=True,  # survive parent claude's exit
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(color(f"\nfailed to spawn helper: {e}", "yellow"))
+        return False
+    print()
+    print(color(
+        f"→ swapping to {label} ({target_sid[:8]}) in this pane "
+        f"once the current response finishes…",
+        "green",
+    ))
+    return True
+
+
+def cmd_traverse(direction, sid_arg, jump=False, jump_inplace=False):
     """direction: 'up' | 'down' | 'self'"""
     sessions = load_sessions()
 
@@ -322,6 +380,9 @@ def cmd_traverse(direction, sid_arg, jump=False):
             print(color("  (no parent — this is a root session)", "dim"))
             return
         print(f"Parent:   {_fmt_row(parent, sessions)}")
+        if jump_inplace:
+            if _jump_inplace(parent, "parent"):
+                return
         if jump:
             if _spawn_resumed(parent, "parent"):
                 return
@@ -338,10 +399,12 @@ def cmd_traverse(direction, sid_arg, jump=False):
     if not kids:
         print(color("  (no children — this is a leaf session)", "dim"))
         return
-    if jump and len(kids) == 1:
+    if (jump or jump_inplace) and len(kids) == 1:
         kid = kids[0]
         print(f"Child:    {_fmt_row(kid['sid'], sessions)}")
-        if _spawn_resumed(kid["sid"], "child"):
+        if jump_inplace and _jump_inplace(kid["sid"], "child"):
+            return
+        if jump and _spawn_resumed(kid["sid"], "child"):
             return
         print()
         print("To resume child:")
@@ -607,16 +670,29 @@ def main():
                     help="override which session to traverse from (prefix ok)")
     ap.add_argument("--jump", action="store_true",
                     help="open the resumed session in a new tmux pane (with --up/--down)")
+    ap.add_argument("--jump-inplace", dest="jump_inplace", action="store_true",
+                    help="swap the current tmux pane to the resumed session (waits for "
+                         "current response to finish, then /exit + claude --resume)")
+    # Internal: invoked by --jump-inplace as a detached helper.
+    ap.add_argument("--pane-swap", dest="pane_swap", action="store_true",
+                    help=argparse.SUPPRESS)
+    ap.add_argument("--pane", help=argparse.SUPPRESS)
+    ap.add_argument("--target", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
+    if args.pane_swap:
+        if not args.pane or not args.target:
+            sys.exit("--pane-swap requires --pane and --target")
+        _pane_swap_loop(args.pane, args.target)
+        return
     if args.show_self:
         cmd_traverse("self", args.sid)
         return
     if args.up:
-        cmd_traverse("up", args.sid, jump=args.jump)
+        cmd_traverse("up", args.sid, jump=args.jump, jump_inplace=args.jump_inplace)
         return
     if args.down:
-        cmd_traverse("down", args.sid, jump=args.jump)
+        cmd_traverse("down", args.sid, jump=args.jump, jump_inplace=args.jump_inplace)
         return
     if args.watch:
         watch_loop(args)

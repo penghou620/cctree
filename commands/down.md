@@ -1,8 +1,8 @@
 ---
-description: Open the /branch child of the current session in a new tmux pane (or list if multiple)
+description: Swap this tmux pane to the child of the current /branch session (or list if multiple)
 allowed-tools: Bash(cctree:*)
 ---
 
-!`cctree --down --jump`
+!`cctree --down --jump-inplace`
 
-Display the output above verbatim to the user. Do not summarize, comment, or add analysis. If there are multiple children, the output lists them and the user must rerun with the specific sid (or `/exit` and `claude --resume <sid>` manually).
+Display the output above verbatim to the user. Do not summarize, comment, or add analysis. With multiple children the swap is skipped and the listing is shown — rerun `cctree --down --sid <prefix> --jump-inplace` (or `/exit` and `claude --resume <sid>` manually) to pick one.
