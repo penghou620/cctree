@@ -171,14 +171,29 @@ def _conversation_sid_from_cmdline(pid):
     return None
 
 
+def _jsonl_exists_for_sid(sid):
+    """True if ~/.claude/projects/*/<sid>.jsonl exists anywhere."""
+    if not sid:
+        return False
+    return bool(glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sid}.jsonl")))
+
+
 def running_claude_pid_to_session():
     """pid -> conversation sessionId for live Claude Code processes.
 
-    Prefer the sid from the process cmdline (claude --resume <sid>) over
-    the peer sid recorded in ~/.claude/sessions/<pid>.json — the latter is
-    a fresh UUID for every resume, so using it makes /up and /down look
-    like they landed in a "new" session when they actually resumed the
-    correct one.
+    Resolution order:
+      1. Peer sid from ~/.claude/sessions/<pid>.json, if a matching jsonl
+         exists on disk. The peer sid updates when the user runs `/resume
+         <sid>` inside claude (the way the pane-swap helper switches
+         sessions), so this is the source of truth for an already-active
+         claude. The jsonl-on-disk check filters out the initial random
+         peer UUID that `claude --resume <sid>` assigns before any
+         conversation writes happen.
+      2. Cmdline `--resume <sid>` / `-r <sid>` / `--session-id <sid>`.
+         Catches the case where claude was just started from the shell
+         and hasn't written to the target jsonl yet (peer sid is still
+         the random startup UUID with no file backing it).
+      3. Peer sid as a last resort.
     """
     out = {}
     d = os.path.expanduser("~/.claude/sessions")
@@ -193,13 +208,15 @@ def running_claude_pid_to_session():
             continue
         if not pid_alive(pid):
             continue
-        sid = _conversation_sid_from_cmdline(pid)
-        if not sid:
-            try:
-                data = json.load(open(os.path.join(d, f)))
-            except Exception:
-                continue
-            sid = data.get("sessionId")
+        try:
+            peer_sid = json.load(open(os.path.join(d, f))).get("sessionId")
+        except Exception:
+            peer_sid = None
+        sid = None
+        if _jsonl_exists_for_sid(peer_sid):
+            sid = peer_sid
+        else:
+            sid = _conversation_sid_from_cmdline(pid) or peer_sid
         if sid:
             out[pid] = sid
     return out
@@ -354,11 +371,16 @@ def _spawn_resumed(target_sid, label):
 
 def _pane_swap_loop(pane, target_sid):
     """Background helper: wait for the pane to stop changing (i.e. claude
-    finished its response), then exit claude and resume target_sid in place.
+    finished its response), then switch the session in place by typing
+    `/resume <sid>` into claude's input box.
+
+    `/resume` is a built-in Claude Code slash command that swaps the
+    active session without restarting the process — the same claude PID
+    keeps running, the conversation sid changes, and the jsonl it writes
+    to changes with it. No C-c C-c, no shell round-trip, no cwd dance.
 
     Logs to ~/.claude/cctree-pane-swap.log so mis-fires are diagnosable.
     """
-    import shlex
     log_path = os.path.expanduser("~/.claude/cctree-pane-swap.log")
 
     def log(msg):
@@ -398,24 +420,7 @@ def _pane_swap_loop(pane, target_sid):
     else:
         log(f"pane stable after {stable} captures")
 
-    # `/exit` typed via send-keys doesn't reliably trigger claude's slash-command
-    # handler (seems the input-box state doesn't always intercept the keys).
-    # Claude Code's TUI exits on Ctrl-C Ctrl-C, which works from any state —
-    # first C-c cancels in-flight work, second C-c quits the process.
-    log("send C-c C-c")
-    subprocess.run(["tmux", "send-keys", "-t", pane, "C-c"])
-    time.sleep(0.4)
-    subprocess.run(["tmux", "send-keys", "-t", pane, "C-c"])
-    time.sleep(2.0)  # wait for claude to actually exit + shell prompt to return
-
-    # cd to the session's recorded cwd first so `claude --resume` resolves
-    # against the right project — otherwise claude may start a fresh session
-    # when the parent lives in a different project dir.
-    cwd = cwd_for_session(target_sid)
-    if cwd:
-        cmd = f"cd {shlex.quote(cwd)} && claude --resume {target_sid}"
-    else:
-        cmd = f"claude --resume {target_sid}"
+    cmd = f"/resume {target_sid}"
     log(f"send: {cmd}")
     subprocess.run(["tmux", "send-keys", "-t", pane, cmd, "Enter"])
     log("done")
@@ -787,8 +792,9 @@ def main():
     ap.add_argument("--jump", action="store_true",
                     help="open the resumed session in a new tmux pane (with --up/--down)")
     ap.add_argument("--jump-inplace", dest="jump_inplace", action="store_true",
-                    help="swap the current tmux pane to the resumed session (waits for "
-                         "current response to finish, then /exit + claude --resume)")
+                    help="swap the current tmux pane's claude session in place "
+                         "(waits for current response to finish, then types "
+                         "/resume <sid> — same process, no restart)")
     # Internal: invoked by --jump-inplace as a detached helper.
     ap.add_argument("--pane-swap", dest="pane_swap", action="store_true",
                     help=argparse.SUPPRESS)
