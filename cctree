@@ -234,38 +234,52 @@ def descendants(root_pid, children):
         stack.extend(children.get(p, []))
 
 
-def tmux_focused_pane_pid(self_pane_id=None):
-    """Return pid of the focused pane in our tmux session, or None.
+def _tmux_focused_pane(self_pane_id=None):
+    """Return (pid, pane_current_path) of the focused pane in our tmux session.
 
-    If the sidebar is itself the focused pane (user clicked into it), we still
-    return its pid — caller decides whether to skip based on self_pane_id.
+    If the focused pane IS the sidebar itself, returns (None, None). Else
+    returns the focused pane's pid plus its shell-level cwd so the sidebar
+    can fall back to "where the user is" when no claude is active yet.
     """
     if not os.environ.get("TMUX"):
-        return None
+        return None, None
     try:
         ses = subprocess.check_output(
             ["tmux", "display", "-p", "#{session_name}"], text=True
         ).strip()
         raw = subprocess.check_output(
             ["tmux", "list-panes", "-s", "-t", ses, "-F",
-             "#{pane_id}|#{?window_active,1,0}|#{?pane_active,1,0}|#{pane_pid}"],
+             "#{pane_id}|#{?window_active,1,0}|#{?pane_active,1,0}|"
+             "#{pane_pid}|#{pane_current_path}"],
             text=True,
         )
     except Exception:
-        return None
+        return None, None
     for line in raw.splitlines():
-        parts = line.split("|")
-        if len(parts) != 4:
+        parts = line.split("|", 4)
+        if len(parts) != 5:
             continue
-        pane_id, win_active, pane_active, pid = parts
+        pane_id, win_active, pane_active, pid, path = parts
         if win_active == "1" and pane_active == "1":
             if self_pane_id and pane_id == self_pane_id:
-                return None  # sidebar is focused — no "other" active pane
+                return None, None
             try:
-                return int(pid)
+                return int(pid), (path or None)
             except ValueError:
-                return None
-    return None
+                return None, (path or None)
+    return None, None
+
+
+def tmux_focused_pane_pid(self_pane_id=None):
+    """Backward-compatible wrapper — returns just the pid."""
+    pid, _ = _tmux_focused_pane(self_pane_id)
+    return pid
+
+
+def tmux_focused_pane_cwd(self_pane_id=None):
+    """cwd of the focused (non-sidebar) pane via tmux, or None."""
+    _, path = _tmux_focused_pane(self_pane_id)
+    return path
 
 
 def find_active_claude_session(self_pane_id=None):
@@ -681,12 +695,22 @@ def watch_loop(args):
     try:
         while True:
             active_sid = find_active_claude_session(self_pane_id)
+            # Prefer the focused *user* pane's actual cwd over the sidebar's
+            # own cwd for any fallback — otherwise the sidebar shows whatever
+            # directory it was spawned from (often ~) even when the user is
+            # working in a project subdir.
+            pane_cwd = tmux_focused_pane_cwd(self_pane_id)
             if active_sid:
-                target = cwd_for_session(active_sid) or (args.path or os.getcwd())
+                target = (
+                    cwd_for_session(active_sid)
+                    or pane_cwd
+                    or args.path
+                    or os.getcwd()
+                )
             elif args.path:
                 target = args.path
             else:
-                target = last_target or os.getcwd()
+                target = pane_cwd or last_target or os.getcwd()
             last_target = target
 
             buf = io.StringIO()
