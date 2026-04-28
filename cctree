@@ -41,6 +41,21 @@ def _set_show_hash(v):
     _SHOW_HASH = bool(v)
 
 
+# Whether to render the date/time column (per-row mtime and header clock).
+# Defaults to True so one-shot `cctree` output is unchanged; watch_loop flips
+# this off at startup and 't' toggles at runtime.
+_SHOW_DATE = True
+
+
+def _show_date():
+    return _SHOW_DATE
+
+
+def _set_show_date(v):
+    global _SHOW_DATE
+    _SHOW_DATE = bool(v)
+
+
 # In --watch mode, top-level roots whose most recent activity (across the
 # whole subtree) is older than this are auto-collapsed on first render, so
 # the sidebar opens on a tight view of recent branches. The user can still
@@ -120,12 +135,35 @@ def scan_session(path):
     }
 
 
+# Cache of parsed session dicts, keyed by jsonl path. Each entry is
+# (mtime_at_scan, session_dict). load_sessions() consults this and only
+# re-parses files whose mtime changed since the last call — crucial when
+# ~/.claude/projects holds thousands of jsonls (each scan_session reads
+# the whole file, so rescanning every tick was the biggest sidebar
+# bottleneck).
+_SESSIONS_MTIME_CACHE = {}
+
+
 def load_sessions():
     out = {}
+    seen = set()
     for f in glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")):
+        try:
+            mt = os.path.getmtime(f)
+        except OSError:
+            continue
+        seen.add(f)
+        cached = _SESSIONS_MTIME_CACHE.get(f)
+        if cached and cached[0] == mt:
+            out[cached[1]["sid"]] = cached[1]
+            continue
         s = scan_session(f)
         if s:
+            _SESSIONS_MTIME_CACHE[f] = (mt, s)
             out[s["sid"]] = s
+    for p in list(_SESSIONS_MTIME_CACHE):
+        if p not in seen:
+            del _SESSIONS_MTIME_CACHE[p]
     return out
 
 
@@ -365,10 +403,12 @@ def _fmt_row(sid, sessions):
     s = sessions.get(sid)
     if not s:
         return f"{sid[:8]}  (not on disk)" if _show_hash() else "(not on disk)"
-    title = s["title"] or "(untitled)"
     date = datetime.fromtimestamp(s["mtime"]).strftime("%m-%d %H:%M")
-    title_colored = color(title, "green") if s["title"] else title
-    if _show_hash():
+    if s["title"]:
+        title_colored = color(s["title"], "green")
+    else:
+        title_colored = color(sid[:8], "cyan")
+    if _show_hash() and s["title"]:
         return f"{color(sid[:8], 'cyan')}  {color(date, 'dim')}  {title_colored}"
     return f"{color(date, 'dim')}  {title_colored}"
 
@@ -594,10 +634,15 @@ def cwd_for_session(sid):
 
 
 def render(sessions, roots, include_unbranched, active_sid=None,
-           selected_sid=None, collapsed_sids=frozenset(), visible_out=None):
+           selected_sid=None, collapsed_sids=frozenset(), visible_out=None,
+           live_sids=frozenset()):
     """Render the tree. In interactive mode (visible_out is not None) adds a
     cursor column + fold indicators, and hides descendants of any sid in
-    collapsed_sids. selected_sid (if set) is drawn with a cursor prefix."""
+    collapsed_sids. selected_sid (if set) is drawn with a cursor prefix.
+
+    live_sids: sessions backed by a live claude process. Roots that contain a
+    live sid are kept visible even when they have no branches yet — so two
+    claudes running in sibling panes both appear before either one forks."""
     children = collections.defaultdict(list)
     for s in sessions.values():
         children[s["parent"]].append(s["sid"])
@@ -623,6 +668,8 @@ def render(sessions, roots, include_unbranched, active_sid=None,
     def contains_active(sid):
         if active_sid and sid == active_sid:
             return True
+        if sid in live_sids:
+            return True
         return any(contains_active(k) for k in children.get(sid, []))
 
     interactive = visible_out is not None
@@ -636,7 +683,10 @@ def render(sessions, roots, include_unbranched, active_sid=None,
         is_active = active_sid and sid == active_sid
         is_selected = interactive and selected_sid == sid
         bullet = "● " if is_active else ""
-        date = datetime.fromtimestamp(s["mtime"]).strftime("%m-%d %H:%M")
+        show_date = _show_date()
+        date = datetime.fromtimestamp(s["mtime"]).strftime("%m-%d %H:%M") if show_date else ""
+        # Width reserved on the right for "  MM-DD HH:MM"; zero when hidden.
+        date_reserve = (2 + len(date)) if show_date else 0
 
         # Interactive mode reserves a 2-char cursor column at the far left and
         # a 2-char fold-indicator slot between the tree connector and bullet.
@@ -654,8 +704,7 @@ def render(sessions, roots, include_unbranched, active_sid=None,
             head_plain = prefix + connector + bullet
             head_colored = head_plain
 
-        # Reserve room for a 2-space gap + date on the right.
-        avail_for_label = max(1, width - len(head_plain) - 2 - len(date))
+        avail_for_label = max(1, width - len(head_plain) - date_reserve)
 
         sid_short = s["sid"][:8]
         show_hash = _show_hash()
@@ -672,18 +721,17 @@ def render(sessions, roots, include_unbranched, active_sid=None,
             else:
                 label_plain = _truncate(marker + s["title"], avail_for_label)
                 label_colored = color(label_plain, "green")
-        elif show_hash:
+        else:
             label_plain = _truncate(sid_short, avail_for_label)
             label_colored = color(label_plain, "cyan")
+
+        if show_date:
+            # Pad between label and date so date right-aligns to the terminal edge.
+            content_len = len(head_plain) + len(label_plain)
+            pad = max(2, width - content_len - len(date))
+            line = head_colored + label_colored + (" " * pad) + color(date, "dim")
         else:
-            label_plain = _truncate("(untitled)", avail_for_label)
-            label_colored = color(label_plain, "dim")
-
-        # Pad between label and date so date right-aligns to the terminal edge.
-        content_len = len(head_plain) + len(label_plain)
-        pad = max(2, width - content_len - len(date))
-
-        line = head_colored + label_colored + (" " * pad) + color(date, "dim")
+            line = head_colored + label_colored
         if is_active and _color_on():
             line = f"\x1b[1;7m{line}\x1b[0m"  # bold + reverse
         print(line)
@@ -705,7 +753,7 @@ def render(sessions, roots, include_unbranched, active_sid=None,
 
 def render_for_scope(sessions, path_filter, include_unbranched, all_projects,
                      active_sid, selected_sid=None, collapsed_sids=frozenset(),
-                     visible_out=None):
+                     visible_out=None, live_sids=frozenset()):
     """Render either a single project (path_filter) or all branched projects."""
     if all_projects:
         groups = collections.defaultdict(dict)
@@ -719,13 +767,15 @@ def render_for_scope(sessions, path_filter, include_unbranched, all_projects,
                 children[s["parent"]].append(s["sid"])
             has_any_branch = any(children.get(sid) for sid in subset)
             has_active = active_sid and active_sid in subset
-            if not include_unbranched and not has_any_branch and not has_active:
+            has_live = any(sid in subset for sid in live_sids)
+            if (not include_unbranched and not has_any_branch
+                    and not has_active and not has_live):
                 continue
             roots = [s["sid"] for s in subset.values() if s["parent"] not in subset]
             print(color(_truncate(f"\n# {cwd}", _term_width() + 1), "bold"))
             render(subset, roots, include_unbranched, active_sid=active_sid,
                    selected_sid=selected_sid, collapsed_sids=collapsed_sids,
-                   visible_out=visible_out)
+                   visible_out=visible_out, live_sids=live_sids)
             rendered_any = True
         if not rendered_any:
             print(color("(no branched sessions anywhere)", "dim"))
@@ -741,7 +791,7 @@ def render_for_scope(sessions, path_filter, include_unbranched, all_projects,
     print(color(_truncate(f"# {target}", _term_width()), "bold"))
     render(subset, roots, include_unbranched, active_sid=active_sid,
            selected_sid=selected_sid, collapsed_sids=collapsed_sids,
-           visible_out=visible_out)
+           visible_out=visible_out, live_sids=live_sids)
 
 
 def _auto_collapse_old_root_sids(sessions, active_sid,
@@ -805,8 +855,10 @@ def watch_loop(args):
 
     self_pane_id = os.environ.get("TMUX_PANE")
     interval = max(0.3, args.interval)
-    last_target = None
     use_alt = _color_on()
+
+    # Watch mode hides the date/time column by default; 't' toggles it back on.
+    _set_show_date(False)
 
     # Put stdin into cbreak mode so we can poll j/k/tab/h without line-buffering.
     # Falls back gracefully if stdin is not a TTY (e.g. redirected for tests).
@@ -828,46 +880,53 @@ def watch_loop(args):
     visible = []  # sids currently on screen, in display order — rebuilt each frame
     auto_collapsed_done = False  # one-shot: seed collapsed_sids with old roots
 
+    # Refreshed state: updated on interval ticks + on cheap pane-change probes,
+    # but never on keypress — so j/k/Tab just re-render from cached values and
+    # stay instant.
+    sessions_cache = {}
+    active_sid = None
+    live_sids = frozenset()
+    target = None
+    last_target = None
+    last_pane_pid = None
+
     if use_alt:
         # Enter alt screen + hide cursor so the sidebar doesn't pollute scrollback
         # and the caret doesn't flicker on every redraw.
         sys.stdout.write("\x1b[?1049h\x1b[?25l")
         sys.stdout.flush()
 
-    # Cache the expensive load_sessions() call between interval ticks so that
-    # key-triggered redraws stay snappy even with many jsonl files on disk.
-    sessions_cache = None
-    sessions_loaded_at = 0.0
+    def refresh_state():
+        nonlocal sessions_cache, active_sid, live_sids, target, last_target
+        nonlocal auto_collapsed_done, last_pane_pid
 
-    def draw():
-        nonlocal visible, selected_sid, sessions_cache, sessions_loaded_at
-        nonlocal last_target, auto_collapsed_done
+        sessions_cache = load_sessions()
 
-        active_sid = find_active_claude_session(self_pane_id)
-        # Prefer the focused *user* pane's actual cwd over the sidebar's own
-        # cwd for any fallback — otherwise the sidebar shows whatever directory
-        # it was spawned from (often ~) even when the user is working in a
-        # project subdir.
-        pane_cwd = tmux_focused_pane_cwd(self_pane_id)
-        if active_sid:
-            target = (
-                cwd_for_session(active_sid)
-                or pane_cwd
-                or args.path
-                or os.getcwd()
+        pane_pid, pane_cwd = _tmux_focused_pane(self_pane_id)
+        last_pane_pid = pane_pid
+        pid_to_sid = running_claude_pid_to_session()
+        live_sids = frozenset(pid_to_sid.values())
+        if pane_pid and pid_to_sid:
+            children = build_pid_children()
+            active_sid = next(
+                (pid_to_sid[p] for p in descendants(pane_pid, children)
+                 if p in pid_to_sid),
+                None,
             )
+        else:
+            active_sid = None
+
+        if active_sid:
+            cached = sessions_cache.get(active_sid)
+            active_cwd = cached["cwd"] if cached else None
+            target = active_cwd or pane_cwd or args.path or os.getcwd()
         elif args.path:
             target = args.path
         else:
             target = pane_cwd or last_target or os.getcwd()
         last_target = target
 
-        now = time.time()
-        if sessions_cache is None or now - sessions_loaded_at >= interval:
-            sessions_cache = load_sessions()
-            sessions_loaded_at = now
-
-        # Auto-collapse idle top-level trees on the very first draw so the
+        # Auto-collapse idle top-level trees on the very first refresh so the
         # sidebar opens focused on recent work. User-driven Tab toggles after
         # this point persist (we don't re-seed on subsequent reloads).
         if interactive and not auto_collapsed_done and sessions_cache:
@@ -876,13 +935,15 @@ def watch_loop(args):
             )
             auto_collapsed_done = True
 
+    def render_frame():
+        nonlocal visible, selected_sid
+
         if selected_sid is None and active_sid:
             selected_sid = active_sid
 
         visible = []
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            ts = datetime.now().strftime("%H:%M:%S")
             if active_sid:
                 active_label = (
                     color(active_sid[:8], "green")
@@ -891,13 +952,16 @@ def watch_loop(args):
                 )
             else:
                 active_label = color("(none)", "dim")
-            header = (
-                color(f"cctree {__version__}", "bold")
-                + color(f"  {ts}  active: ", "dim")
-                + active_label
-            )
+            header = color(f"cctree {__version__}", "bold")
+            if _show_date():
+                ts = datetime.now().strftime("%H:%M:%S")
+                header += color(f"  {ts}  active: ", "dim") + active_label
+            else:
+                header += color("  active: ", "dim") + active_label
             if interactive:
-                header += color("  ·  j/k: move  Tab: fold  h: hash  q: quit", "dim")
+                header += color(
+                    "  ·  j/k: move  Tab: fold  h: hash  t: time  q: quit", "dim"
+                )
             print(header)
             print()
             render_for_scope(
@@ -909,6 +973,7 @@ def watch_loop(args):
                 selected_sid=selected_sid if interactive else None,
                 collapsed_sids=collapsed_sids,
                 visible_out=visible if interactive else None,
+                live_sids=live_sids,
             )
 
         # If the selected sid vanished (e.g. its ancestor was collapsed, or it
@@ -924,6 +989,14 @@ def watch_loop(args):
         sys.stdout.write(frame)
         sys.stdout.flush()
 
+    def pane_changed():
+        """Cheap probe: did the focused tmux pane's pid change since the last
+        refresh? One tmux call, no ps/glob. Lets us react to pane switches
+        well before the next interval tick without paying for a full state
+        refresh on every loop iteration."""
+        pid, _ = _tmux_focused_pane(self_pane_id)
+        return pid != last_pane_pid
+
     def handle_key(key):
         """Return True if the frame needs an immediate redraw, False if no-op,
         or the string 'quit' to break the outer loop."""
@@ -932,6 +1005,9 @@ def watch_loop(args):
             return "quit"
         if key in ("h", "H"):
             _set_show_hash(not _show_hash())
+            return True
+        if key in ("t", "T"):
+            _set_show_date(not _show_date())
             return True
         if not visible:
             return False
@@ -961,12 +1037,15 @@ def watch_loop(args):
 
     try:
         while True:
-            draw()
-            # Wait either for the next interval tick or for a key event, whichever
-            # comes first. Key events fire an immediate redraw for responsiveness.
+            refresh_state()
+            render_frame()
+            # Between interval ticks, serve keypress-driven redraws from cached
+            # state (fast path). Also poll for tmux pane changes every ~200ms so
+            # the sidebar reacts to "user switched panes" without waiting a full
+            # interval for the next refresh.
             deadline = time.time() + interval
-            redraw = False
-            while time.time() < deadline and not redraw:
+            last_probe = time.time()
+            while time.time() < deadline:
                 if interactive:
                     remaining = max(0.02, min(0.1, deadline - time.time()))
                     r, _, _ = select.select([sys.stdin], [], [], remaining)
@@ -975,9 +1054,14 @@ def watch_loop(args):
                         if result == "quit":
                             return
                         if result:
-                            redraw = True
+                            render_frame()
                 else:
                     time.sleep(min(0.1, max(0.0, deadline - time.time())))
+                now = time.time()
+                if now - last_probe >= 0.2:
+                    last_probe = now
+                    if pane_changed():
+                        break  # fall through to a full refresh+render
     except KeyboardInterrupt:
         pass
     finally:
@@ -1075,12 +1159,15 @@ def main():
         matches = [sid for sid in sessions if sid.startswith(args.highlight)]
         active_sid = matches[0] if matches else args.highlight
 
+    live_sids = frozenset(running_claude_pid_to_session().values())
+
     render_for_scope(
         sessions,
         path_filter=args.path or os.getcwd(),
         include_unbranched=args.all_sessions,
         all_projects=args.all,
         active_sid=active_sid,
+        live_sids=live_sids,
     )
 
 
