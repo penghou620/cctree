@@ -14,9 +14,9 @@ One-liner:
 curl -fsSL https://raw.githubusercontent.com/penghou620/cctree/main/install.sh | bash
 ```
 
-This clones the repo to `~/.local/share/cctree` and symlinks `cctree` and `cctree-sidebar` into `~/.local/bin`. Re-running updates to the latest commit. If stdin is a tty it also offers to append the `prefix + C-c` tmux binding to `~/.tmux.conf`.
+This clones the repo to `~/.local/share/cctree` and symlinks `cctree` and `cctree-sidebar` into `~/.local/bin`. Re-running updates to the latest commit. When run on a tty it prompts for the install dir, bin dir, and whether to append the `prefix + C-c` tmux binding to `~/.tmux.conf`.
 
-Env overrides:
+Skip a prompt by setting its env var (each one falls back to the default on non-tty runs):
 
 - `CCTREE_INSTALL_DIR`          — where to clone the repo (default `~/.local/share/cctree`)
 - `CCTREE_BIN_DIR`              — where to symlink binaries (default `~/.local/bin`)
