@@ -2,7 +2,7 @@
 
 ## Robustness / scope
 - Cross-window detection — `find_active_claude_session` only looks in the current tmux session's panes (`list-panes -s`). If you have multiple windows, the sidebar goes blank when you switch windows. Showing live `●` markers for all live claudes regardless of pane (we already track `live_sids`) plus following the focused window would fix this.
-- fsevents/inotify instead of full re-glob — `load_sessions()` re-globs `~/.claude/projects/*/*.jsonl` every tick. The mtime cache helps, but the directory scan itself is O(N). At ~1s intervals × thousands of files this adds up. Watching the projects dir would let us drop the interval and react instantly.
+- Per-file watches for content updates — kqueue on `~/.claude/projects/` (already in place) catches new/deleted sessions instantly, but appends to existing jsonls don't fire dir events, so mtime updates still rely on interval polling. Watching the active session's fd directly would close that gap. Linux/Windows still need a real backend (current fallback is "always rescan"); inotify via ctypes or watchdog as an optional dep would do it.
 - Configurable auto-collapse threshold — `AUTO_COLLAPSE_OLDER_THAN_SECONDS = 24*3600` is hardcoded. One env var (`CCTREE_AUTO_COLLAPSE_HOURS`) is cheap.
 
 ## Code health

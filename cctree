@@ -179,26 +179,223 @@ def scan_session(path):
 _SESSIONS_MTIME_CACHE = {}
 
 
-def load_sessions():
-    out = {}
-    seen = set()
-    for f in glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")):
+class _ProjectsWatcher:
+    """Optional kqueue-based watcher for ~/.claude/projects/.
+
+    Watches the parent dir and each project subdir for *structural* changes
+    (jsonl files added/deleted/renamed, new project subdirs appearing).
+    Two payoffs for the watch loop:
+
+      - load_sessions() can fast-path on idle ticks: when no events have
+        fired since the last call, the file set is unchanged so we skip
+        the scandir over every project dir and just re-stat the cached
+        paths for content updates.
+      - The watch loop can select() on the kqueue fd alongside stdin,
+        so a new session in another pane shows up immediately rather
+        than after the next interval tick.
+
+    NOT a watch on file *content* — kqueue on a directory does not fire
+    when an existing file is appended to. Mtime updates on existing
+    sessions still need interval polling.
+
+    Falls back to a no-op (always-dirty) implementation on platforms
+    without select.kqueue (Linux, Windows). Callers should treat the
+    `enabled` property as the signal for whether the fast path applies.
+    """
+
+    def __init__(self):
+        self._enabled = False
+        self._dirty = True
+        self._dir_fds = {}
+        self._kq = None
+        self._select = None
         try:
-            mt = os.path.getmtime(f)
+            import select as _select
+        except ImportError:
+            return
+        if not hasattr(_select, "kqueue"):
+            return
+        try:
+            self._kq = _select.kqueue()
+        except OSError:
+            return
+        self._select = _select
+        self._refresh_watches()
+        # If we couldn't establish a single watch (e.g. ~/.claude/projects
+        # doesn't exist yet), give up and let load_sessions fall back to
+        # the always-rescan path. The user can restart cctree once claude
+        # has created the directory.
+        if not self._dir_fds:
+            try:
+                self._kq.close()
+            except OSError:
+                pass
+            self._kq = None
+            return
+        self._enabled = True
+
+    @property
+    def enabled(self):
+        return self._enabled
+
+    @property
+    def fd(self):
+        """Underlying kqueue fd, or None when disabled. Selectable so the
+        watch loop can wake on filesystem events."""
+        return self._kq.fileno() if self._kq is not None else None
+
+    def _watch_dir(self, path):
+        if path in self._dir_fds:
+            return
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            ev = self._select.kevent(
+                fd,
+                filter=self._select.KQ_FILTER_VNODE,
+                flags=(self._select.KQ_EV_ADD | self._select.KQ_EV_CLEAR),
+                fflags=(self._select.KQ_NOTE_WRITE
+                        | self._select.KQ_NOTE_DELETE
+                        | self._select.KQ_NOTE_RENAME),
+            )
+            self._kq.control([ev], 0, 0)
+        except OSError:
+            os.close(fd)
+            return
+        self._dir_fds[path] = fd
+
+    def _refresh_watches(self):
+        """Add watches for the parent and each subdir we don't already
+        cover. Cheap to call repeatedly — _watch_dir short-circuits on
+        paths we've already registered."""
+        projects = os.path.expanduser("~/.claude/projects")
+        if not os.path.isdir(projects):
+            return
+        self._watch_dir(projects)
+        try:
+            with os.scandir(projects) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            self._watch_dir(entry.path)
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+
+    def consume_events(self):
+        """Drain pending kqueue events. Returns True if any fired.
+        Sets the internal dirty flag so the next is_dirty() reports
+        stale even if no further events arrive."""
+        if self._kq is None:
+            return False
+        try:
+            events = self._kq.control(None, 32, 0)
+        except OSError:
+            return False
+        if events:
+            self._dirty = True
+            # A subdir might have been created — pick it up so its
+            # contents trigger events too. Watches on deleted dirs are
+            # auto-removed by kqueue when the fd closes; we leak the fd
+            # here, which is bounded since project dirs are rarely
+            # deleted.
+            self._refresh_watches()
+            return True
+        return False
+
+    def is_dirty(self):
+        if not self._enabled:
+            return True
+        self.consume_events()
+        return self._dirty
+
+    def mark_clean(self):
+        self._dirty = False
+
+    def close(self):
+        for fd in self._dir_fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._dir_fds.clear()
+        if self._kq is not None:
+            try:
+                self._kq.close()
+            except OSError:
+                pass
+            self._kq = None
+        self._enabled = False
+
+
+def load_sessions(watcher=None):
+    """Return sid -> session dict for every jsonl under ~/.claude/projects.
+
+    If `watcher` is supplied and reports clean (no fs events since the
+    last call), the file set is unchanged so we skip scandir entirely
+    and just re-stat the cached paths for mtime updates. Otherwise we
+    walk the project dirs to discover new/deleted files.
+    """
+    fast = watcher is not None and watcher.enabled and not watcher.is_dirty()
+    out = {}
+    if fast and _SESSIONS_MTIME_CACHE:
+        for path, (cached_mt, cached_s) in list(_SESSIONS_MTIME_CACHE.items()):
+            try:
+                mt = os.path.getmtime(path)
+            except OSError:
+                # File vanished between events — rare on the fast path
+                # since the watcher would have fired. Drop and move on.
+                del _SESSIONS_MTIME_CACHE[path]
+                continue
+            if mt == cached_mt:
+                out[cached_s["sid"]] = cached_s
+                continue
+            s = scan_session(path)
+            if s:
+                _SESSIONS_MTIME_CACHE[path] = (mt, s)
+                out[s["sid"]] = s
+        return out
+
+    seen = set()
+    projects = os.path.expanduser("~/.claude/projects")
+    # scandir nested edges out glob+getmtime: pulls mtime from the dirent
+    # without an extra stat per file.
+    try:
+        with os.scandir(projects) as outer:
+            subdirs = [e.path for e in outer if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        subdirs = []
+    for d in subdirs:
+        try:
+            with os.scandir(d) as inner:
+                entries = list(inner)
         except OSError:
             continue
-        seen.add(f)
-        cached = _SESSIONS_MTIME_CACHE.get(f)
-        if cached and cached[0] == mt:
-            out[cached[1]["sid"]] = cached[1]
-            continue
-        s = scan_session(f)
-        if s:
-            _SESSIONS_MTIME_CACHE[f] = (mt, s)
-            out[s["sid"]] = s
+        for f in entries:
+            if not f.name.endswith(".jsonl"):
+                continue
+            try:
+                mt = f.stat().st_mtime
+            except OSError:
+                continue
+            path = f.path
+            seen.add(path)
+            cached = _SESSIONS_MTIME_CACHE.get(path)
+            if cached and cached[0] == mt:
+                out[cached[1]["sid"]] = cached[1]
+                continue
+            s = scan_session(path)
+            if s:
+                _SESSIONS_MTIME_CACHE[path] = (mt, s)
+                out[s["sid"]] = s
     for p in list(_SESSIONS_MTIME_CACHE):
         if p not in seen:
             del _SESSIONS_MTIME_CACHE[p]
+    if watcher is not None:
+        watcher.mark_clean()
     return out
 
 
@@ -1021,6 +1218,12 @@ def watch_loop(args):
     # Watch mode hides the date/time column by default; 't' toggles it back on.
     _set_show_date(False)
 
+    # kqueue watcher on ~/.claude/projects — lets load_sessions() skip the
+    # full scandir on idle ticks and lets the inner select() wake on new/
+    # deleted sessions without waiting for the next interval. No-op on
+    # platforms without kqueue (Linux/Windows fall back to polling).
+    fs_watcher = _ProjectsWatcher()
+
     # Put stdin into cbreak mode so we can poll j/k/tab/h without line-buffering.
     # Falls back gracefully if stdin is not a TTY (e.g. redirected for tests).
     old_tty = None
@@ -1081,7 +1284,7 @@ def watch_loop(args):
         nonlocal sessions_cache, active_sid, live_sids, target, last_target
         nonlocal auto_collapsed_done, last_pane_pid, last_focused_pane_id
 
-        sessions_cache = load_sessions()
+        sessions_cache = load_sessions(fs_watcher)
 
         pane_id, pane_pid, pane_cwd = _tmux_focused_pane(self_pane_id)
         last_pane_pid = pane_pid
@@ -1372,21 +1575,37 @@ def watch_loop(args):
             # Between interval ticks, serve keypress-driven redraws from cached
             # state (fast path). Also poll for tmux pane changes every ~200ms so
             # the sidebar reacts to "user switched panes" without waiting a full
-            # interval for the next refresh.
+            # interval for the next refresh. The kqueue fd (when available) is
+            # added to the select set so new/deleted sessions surface
+            # immediately rather than after the next tick.
             deadline = time.time() + interval
             last_probe = time.time()
             while time.time() < deadline:
+                fds = []
                 if interactive:
-                    remaining = max(0.02, min(0.1, deadline - time.time()))
-                    r, _, _ = select.select([sys.stdin], [], [], remaining)
-                    if r:
-                        result = handle_key(_read_key())
-                        if result == "quit":
-                            return
-                        if result:
-                            render_frame()
+                    fds.append(sys.stdin)
+                watcher_fd = fs_watcher.fd
+                if watcher_fd is not None:
+                    fds.append(watcher_fd)
+                remaining = max(0.02, min(0.1, deadline - time.time()))
+                if fds:
+                    r, _, _ = select.select(fds, [], [], remaining)
                 else:
-                    time.sleep(min(0.1, max(0.0, deadline - time.time())))
+                    time.sleep(remaining)
+                    r = []
+                if interactive and sys.stdin in r:
+                    result = handle_key(_read_key())
+                    if result == "quit":
+                        return
+                    if result:
+                        render_frame()
+                if watcher_fd is not None and watcher_fd in r:
+                    # Drain events and bail to the outer loop so the new
+                    # state lands on screen before any keystroke. The
+                    # consume_events() call also marks the cache stale
+                    # so the upcoming load_sessions() does a full rescan.
+                    fs_watcher.consume_events()
+                    break
                 now = time.time()
                 if now - last_probe >= 0.2:
                     last_probe = now
@@ -1395,6 +1614,7 @@ def watch_loop(args):
     except KeyboardInterrupt:
         pass
     finally:
+        fs_watcher.close()
         if use_alt:
             sys.stdout.write("\x1b[?25h\x1b[?1049l")
             sys.stdout.flush()
