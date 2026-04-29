@@ -90,10 +90,40 @@ def is_preamble(text: str) -> bool:
     return any(t.startswith(p) for p in preambles)
 
 
+def _parse_iso_ts(s):
+    """ISO 8601 string → POSIX seconds, or None on failure. Accepts the
+    trailing-Z UTC form Claude Code writes (`2026-04-13T12:42:43.930Z`)."""
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _file_birthtime(path):
+    """Best-effort file *creation* time, in POSIX seconds.
+
+    macOS/BSD provide `st_birthtime`; Linux does not, so we fall back to
+    mtime. Used as a last-resort sort key when the jsonl has no parseable
+    message timestamp."""
+    try:
+        st = os.stat(path)
+        return getattr(st, "st_birthtime", st.st_mtime)
+    except OSError:
+        return 0.0
+
+
 def scan_session(path):
-    """Return dict of { sessionId, cwd, forkedFrom, title, first, mtime } or None."""
+    """Return dict of { sessionId, cwd, forkedFrom, title, first, created, mtime } or None.
+
+    `created` is the timestamp of the first message in the conversation —
+    a stable creation time that doesn't shift as the session is updated.
+    `mtime` is the file's last-modified time (used for the date column and
+    auto-collapse heuristics)."""
     sid = os.path.basename(path)[:-6]
     parent = parent_msg = cwd = first = title = custom_title = None
+    created = None
     try:
         with open(path) as fh:
             for line in fh:
@@ -121,6 +151,10 @@ def scan_session(path):
                     txt = extract_text(msg.get("content"))
                     if txt and not is_preamble(txt):
                         first = txt.strip().replace("\n", " ")
+                if created is None:
+                    ts = _parse_iso_ts(d.get("timestamp"))
+                    if ts is not None:
+                        created = ts
     except Exception:
         return None
     return {
@@ -131,6 +165,7 @@ def scan_session(path):
         "title": custom_title or title,
         "title_custom": bool(custom_title),
         "first": first or "(no user prompt)",
+        "created": created if created is not None else _file_birthtime(path),
         "mtime": os.path.getmtime(path),
     }
 
@@ -311,14 +346,14 @@ def descendants(root_pid, children):
 
 
 def _tmux_focused_pane(self_pane_id=None):
-    """Return (pid, pane_current_path) of the focused pane in our tmux session.
+    """Return (pane_id, pid, pane_current_path) of the focused pane in our tmux session.
 
-    If the focused pane IS the sidebar itself, returns (None, None). Else
-    returns the focused pane's pid plus its shell-level cwd so the sidebar
+    If the focused pane IS the sidebar itself, returns (None, None, None). Else
+    returns the focused pane's id, pid, and shell-level cwd so the sidebar
     can fall back to "where the user is" when no claude is active yet.
     """
     if not os.environ.get("TMUX"):
-        return None, None
+        return None, None, None
     try:
         ses = subprocess.check_output(
             ["tmux", "display", "-p", "#{session_name}"], text=True
@@ -330,7 +365,7 @@ def _tmux_focused_pane(self_pane_id=None):
             text=True,
         )
     except Exception:
-        return None, None
+        return None, None, None
     for line in raw.splitlines():
         parts = line.split("|", 4)
         if len(parts) != 5:
@@ -338,23 +373,23 @@ def _tmux_focused_pane(self_pane_id=None):
         pane_id, win_active, pane_active, pid, path = parts
         if win_active == "1" and pane_active == "1":
             if self_pane_id and pane_id == self_pane_id:
-                return None, None
+                return None, None, None
             try:
-                return int(pid), (path or None)
+                return pane_id, int(pid), (path or None)
             except ValueError:
-                return None, (path or None)
-    return None, None
+                return pane_id, None, (path or None)
+    return None, None, None
 
 
 def tmux_focused_pane_pid(self_pane_id=None):
     """Backward-compatible wrapper — returns just the pid."""
-    pid, _ = _tmux_focused_pane(self_pane_id)
+    _, pid, _ = _tmux_focused_pane(self_pane_id)
     return pid
 
 
 def tmux_focused_pane_cwd(self_pane_id=None):
     """cwd of the focused (non-sidebar) pane via tmux, or None."""
-    _, path = _tmux_focused_pane(self_pane_id)
+    _, _, path = _tmux_focused_pane(self_pane_id)
     return path
 
 
@@ -490,6 +525,23 @@ def _pane_swap_loop(pane, target_sid):
     log("done")
 
 
+def _spawn_pane_swap_helper(pane_id, target_sid):
+    """Spawn the detached pane-swap helper that types `/resume <sid>` into
+    the given pane once claude is idle. Returns True on success, False if
+    Popen itself failed."""
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__),
+             "--pane-swap", "--pane", pane_id, "--target", target_sid],
+            start_new_session=True,  # survive parent claude's exit
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _jump_inplace(target_sid, label):
     """Schedule an in-place pane swap to target_sid via a detached helper."""
     pane = os.environ.get("TMUX_PANE")
@@ -497,16 +549,8 @@ def _jump_inplace(target_sid, label):
         print()
         print(color("(--jump-inplace needs tmux)", "dim"))
         return False
-    try:
-        subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__),
-             "--pane-swap", "--pane", pane, "--target", target_sid],
-            start_new_session=True,  # survive parent claude's exit
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as e:
-        print(color(f"\nfailed to spawn helper: {e}", "yellow"))
+    if not _spawn_pane_swap_helper(pane, target_sid):
+        print(color("\nfailed to spawn helper", "yellow"))
         return False
     # Include the wall-clock time so a *replayed* /up (from session history
     # re-rendered after a resume) is visually distinguishable from a fresh
@@ -569,7 +613,7 @@ def cmd_traverse(direction, sid_arg, jump=False, jump_inplace=False):
     # down
     kids = sorted(
         (c for c in sessions.values() if c["parent"] == full),
-        key=lambda c: c["mtime"],
+        key=lambda c: c["created"],
     )
     if not kids:
         print(color("  (no children — this is a leaf session)", "dim"))
@@ -616,6 +660,39 @@ def _truncate(text, width):
     return text[: width - 1] + "…"
 
 
+# Keybinding rows for the watch-mode help overlay. Two columns: the key on
+# the left (cyan), description on the right.
+_HELP_BINDINGS = [
+    ("j / ↓",   "move selection down"),
+    ("k / ↑",   "move selection up"),
+    ("g / G",   "first / last visible row"),
+    ("Tab",     "collapse / expand node"),
+    ("↵",       "swap focused pane to selected"),
+    ("/",       "filter (Esc to clear)"),
+    ("r",       "rename selected session"),
+    ("h",       "toggle session id hash column"),
+    ("t",       "toggle date/time column"),
+    ("?",       "toggle this help"),
+    ("q / Esc", "quit"),
+]
+
+
+def _render_help_overlay():
+    """Print the help overlay. Called instead of the tree when the user has
+    `?` toggled on. Caller has already printed the header + a blank line."""
+    print(color("keybindings", "bold"))
+    key_w = max(len(k) for k, _ in _HELP_BINDINGS)
+    width = _term_width()
+    for k, desc in _HELP_BINDINGS:
+        line = color(k.ljust(key_w), "cyan") + "  " + desc
+        # Truncation is per-column to avoid clipping the key when the desc
+        # is long; the desc gets truncated instead.
+        budget = width - (key_w + 2)
+        if len(desc) > budget:
+            line = color(k.ljust(key_w), "cyan") + "  " + _truncate(desc, budget)
+        print(line)
+
+
 def cwd_for_session(sid):
     """Return the cwd recorded for sessionId, by peeking its JSONL header."""
     for f in glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sid}.jsonl")):
@@ -633,21 +710,48 @@ def cwd_for_session(sid):
     return None
 
 
+def _write_custom_title(sid, title):
+    """Append a `custom-title` line to sid's jsonl. scan_session reads the
+    last one wins, so this overrides any prior title.
+
+    Returns True on success, False if the jsonl wasn't found or the write
+    failed."""
+    paths = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sid}.jsonl"))
+    if not paths:
+        return False
+    line = json.dumps(
+        {"type": "custom-title", "customTitle": title, "sessionId": sid},
+        separators=(",", ":"),
+    ) + "\n"
+    try:
+        with open(paths[0], "a") as fh:
+            fh.write(line)
+    except OSError:
+        return False
+    return True
+
+
 def render(sessions, roots, include_unbranched, active_sid=None,
            selected_sid=None, collapsed_sids=frozenset(), visible_out=None,
-           live_sids=frozenset()):
+           live_sids=frozenset(), filter_query=""):
     """Render the tree. In interactive mode (visible_out is not None) adds a
     cursor column + fold indicators, and hides descendants of any sid in
     collapsed_sids. selected_sid (if set) is drawn with a cursor prefix.
 
     live_sids: sessions backed by a live claude process. Roots that contain a
     live sid are kept visible even when they have no branches yet — so two
-    claudes running in sibling panes both appear before either one forks."""
+    claudes running in sibling panes both appear before either one forks.
+
+    filter_query: case-insensitive substring; rows whose title/sid match are
+    highlighted, ancestors of matches are kept normal, everything else is
+    dimmed. Collapsed nodes whose subtree contains a match auto-expand."""
     children = collections.defaultdict(list)
     for s in sessions.values():
         children[s["parent"]].append(s["sid"])
+    # Sort by *creation* time so the tree order is stable — sorting by mtime
+    # caused branches to reshuffle whenever the user touched an old session.
     for sids in children.values():
-        sids.sort(key=lambda x: sessions[x]["mtime"])
+        sids.sort(key=lambda x: sessions[x]["created"])
 
     # Inherit parent's title when child has none (a fork continues the thread).
     for sid, s in sessions.items():
@@ -672,6 +776,34 @@ def render(sessions, roots, include_unbranched, active_sid=None,
             return True
         return any(contains_active(k) for k in children.get(sid, []))
 
+    fq = (filter_query or "").lower()
+
+    def row_match(sid):
+        s = sessions[sid]
+        hay = ((s.get("title") or "") + " " + sid[:8]).lower()
+        return fq in hay if fq else False
+
+    _subtree_match_cache = {}
+
+    def subtree_match(sid):
+        if sid in _subtree_match_cache:
+            return _subtree_match_cache[sid]
+        m = row_match(sid) or any(subtree_match(k) for k in children.get(sid, []))
+        _subtree_match_cache[sid] = m
+        return m
+
+    _subtree_size_cache = {}
+
+    def subtree_size(sid):
+        """Total number of descendants under sid (excludes sid itself)."""
+        if sid in _subtree_size_cache:
+            return _subtree_size_cache[sid]
+        n = 0
+        for k in children.get(sid, []):
+            n += 1 + subtree_size(k)
+        _subtree_size_cache[sid] = n
+        return n
+
     interactive = visible_out is not None
     width = _term_width()
 
@@ -679,6 +811,10 @@ def render(sessions, roots, include_unbranched, active_sid=None,
         s = sessions[sid]
         kids = children.get(sid, [])
         is_collapsed = interactive and sid in collapsed_sids and bool(kids)
+        # Auto-expand collapsed nodes whose subtree contains a filter match,
+        # otherwise the user types `/foo` and sees nothing.
+        if fq and is_collapsed and subtree_match(sid):
+            is_collapsed = False
         connector = "└─ " if is_last else "├─ "
         is_active = active_sid and sid == active_sid
         is_selected = interactive and selected_sid == sid
@@ -704,7 +840,15 @@ def render(sessions, roots, include_unbranched, active_sid=None,
             head_plain = prefix + connector + bullet
             head_colored = head_plain
 
-        avail_for_label = max(1, width - len(head_plain) - date_reserve)
+        # Collapsed nodes get a dim "(N)" suffix showing how many descendants
+        # are hidden — appended to the label rather than the fold column to
+        # avoid the label horizontally shifting on every toggle.
+        if interactive and is_collapsed and kids:
+            count_suffix = f" ({subtree_size(sid)})"
+        else:
+            count_suffix = ""
+
+        avail_for_label = max(1, width - len(head_plain) - date_reserve - len(count_suffix))
 
         sid_short = s["sid"][:8]
         show_hash = _show_hash()
@@ -725,6 +869,19 @@ def render(sessions, roots, include_unbranched, active_sid=None,
             label_plain = _truncate(sid_short, avail_for_label)
             label_colored = color(label_plain, "cyan")
 
+        # Filter overrides: yellow for direct matches, dim for non-ancestors.
+        # Ancestors-of-matches keep their normal coloring so the path is
+        # readable.
+        if fq:
+            if row_match(sid):
+                label_colored = color(label_plain, "yellow")
+            elif not subtree_match(sid):
+                label_colored = color(label_plain, "dim")
+
+        if count_suffix:
+            label_plain += count_suffix
+            label_colored += color(count_suffix, "dim")
+
         if show_date:
             # Pad between label and date so date right-aligns to the terminal edge.
             content_len = len(head_plain) + len(label_plain)
@@ -744,7 +901,7 @@ def render(sessions, roots, include_unbranched, active_sid=None,
             walk(c, new_prefix, i == len(kids) - 1)
 
     shown = [r for r in roots if include_unbranched or has_branch(r) or contains_active(r)]
-    shown.sort(key=lambda x: sessions[x]["mtime"])
+    shown.sort(key=lambda x: sessions[x]["created"])
     for i, r in enumerate(shown):
         walk(r, "", i == len(shown) - 1)
     if not shown:
@@ -753,7 +910,7 @@ def render(sessions, roots, include_unbranched, active_sid=None,
 
 def render_for_scope(sessions, path_filter, include_unbranched, all_projects,
                      active_sid, selected_sid=None, collapsed_sids=frozenset(),
-                     visible_out=None, live_sids=frozenset()):
+                     visible_out=None, live_sids=frozenset(), filter_query=""):
     """Render either a single project (path_filter) or all branched projects."""
     if all_projects:
         groups = collections.defaultdict(dict)
@@ -775,7 +932,8 @@ def render_for_scope(sessions, path_filter, include_unbranched, all_projects,
             print(color(_truncate(f"\n# {cwd}", _term_width() + 1), "bold"))
             render(subset, roots, include_unbranched, active_sid=active_sid,
                    selected_sid=selected_sid, collapsed_sids=collapsed_sids,
-                   visible_out=visible_out, live_sids=live_sids)
+                   visible_out=visible_out, live_sids=live_sids,
+                   filter_query=filter_query)
             rendered_any = True
         if not rendered_any:
             print(color("(no branched sessions anywhere)", "dim"))
@@ -791,7 +949,8 @@ def render_for_scope(sessions, path_filter, include_unbranched, all_projects,
     print(color(_truncate(f"# {target}", _term_width()), "bold"))
     render(subset, roots, include_unbranched, active_sid=active_sid,
            selected_sid=selected_sid, collapsed_sids=collapsed_sids,
-           visible_out=visible_out, live_sids=live_sids)
+           visible_out=visible_out, live_sids=live_sids,
+           filter_query=filter_query)
 
 
 def _auto_collapse_old_root_sids(sessions, active_sid,
@@ -830,9 +989,9 @@ def _auto_collapse_old_root_sids(sessions, active_sid,
 def _read_key():
     """Read one key from stdin (which must already be in cbreak mode).
 
-    Returns a symbolic name for special keys (UP/DOWN/TAB/ENTER/ESC) or the
-    literal character otherwise. Handles multi-byte ESC sequences for arrow
-    keys."""
+    Returns a symbolic name for special keys (UP/DOWN/TAB/ENTER/ESC/BACKSPACE)
+    or the literal character otherwise. Handles multi-byte ESC sequences for
+    arrow keys."""
     import select
     ch = sys.stdin.read(1)
     if ch == "\x1b":
@@ -845,6 +1004,8 @@ def _read_key():
         return "TAB"
     if ch in ("\r", "\n"):
         return "ENTER"
+    if ch in ("\x7f", "\b"):
+        return "BACKSPACE"
     return ch
 
 
@@ -889,6 +1050,26 @@ def watch_loop(args):
     target = None
     last_target = None
     last_pane_pid = None
+    # Most recent non-sidebar focused pane id. Enter-to-swap targets this so
+    # the user can move focus into the sidebar to navigate (j/k/Tab) and still
+    # have the swap land on the pane they came from.
+    last_focused_pane_id = None
+    # (msg, expiry_ts) for the transient feedback line shown under the header
+    # after Enter is pressed. None = no message.
+    swap_status = None
+    # `/` filter state. filter_mode=True while user is typing the query;
+    # filter_query is the (lowercased downstream) substring matched against
+    # row titles + sid prefix. Empty query means "no filter active".
+    filter_query = ""
+    filter_mode = False
+    # `r` rename state. rename_mode=True while user is editing the title;
+    # rename_value holds the current input. Pre-filled with the existing
+    # title on entry so the user can tweak rather than retype.
+    rename_mode = False
+    rename_value = ""
+    # `?` toggles a full keybindings overlay so the inline legend can stay
+    # tight on a 47-col sidebar.
+    help_visible = False
 
     if use_alt:
         # Enter alt screen + hide cursor so the sidebar doesn't pollute scrollback
@@ -898,12 +1079,16 @@ def watch_loop(args):
 
     def refresh_state():
         nonlocal sessions_cache, active_sid, live_sids, target, last_target
-        nonlocal auto_collapsed_done, last_pane_pid
+        nonlocal auto_collapsed_done, last_pane_pid, last_focused_pane_id
 
         sessions_cache = load_sessions()
 
-        pane_pid, pane_cwd = _tmux_focused_pane(self_pane_id)
+        pane_id, pane_pid, pane_cwd = _tmux_focused_pane(self_pane_id)
         last_pane_pid = pane_pid
+        # Keep the last non-sidebar pane id so Enter still works after the
+        # user has moved focus into the sidebar to navigate.
+        if pane_id is not None:
+            last_focused_pane_id = pane_id
         pid_to_sid = running_claude_pid_to_session()
         live_sids = frozenset(pid_to_sid.values())
         if pane_pid and pid_to_sid:
@@ -959,22 +1144,47 @@ def watch_loop(args):
             else:
                 header += color("  active: ", "dim") + active_label
             if interactive:
-                header += color(
-                    "  ·  j/k: move  Tab: fold  h: hash  t: time  q: quit", "dim"
-                )
+                header += color("  ·  ?: help  q: quit", "dim")
             print(header)
+            if swap_status and time.time() < swap_status[1]:
+                swap_color = "green" if swap_status[0].startswith("→") else "yellow"
+                print(color(swap_status[0], swap_color))
+            if rename_mode:
+                # While editing — show prompt with trailing cursor.
+                print(
+                    color("rename: ", "cyan")
+                    + color(rename_value, "yellow")
+                    + color("_", "dim")
+                )
+            elif filter_mode:
+                # While typing — show the prompt with a trailing cursor.
+                print(color(f"/{filter_query}", "yellow") + color("_", "dim"))
+            elif filter_query:
+                # Filter committed — keep it visible and remind how to clear.
+                print(
+                    color(f"filter: /{filter_query}", "yellow")
+                    + color("   (Esc: clear)", "dim")
+                )
             print()
-            render_for_scope(
-                sessions_cache,
-                path_filter=target,
-                include_unbranched=args.all_sessions,
-                all_projects=args.all,
-                active_sid=active_sid,
-                selected_sid=selected_sid if interactive else None,
-                collapsed_sids=collapsed_sids,
-                visible_out=visible if interactive else None,
-                live_sids=live_sids,
-            )
+            if help_visible:
+                # Overlay replaces the tree until any key is pressed. Keeping
+                # the tree out makes wide bindings readable on narrow sidebars.
+                _render_help_overlay()
+                # `visible` is intentionally left empty — j/k navigation is
+                # disabled until the overlay closes, which is what we want.
+            else:
+                render_for_scope(
+                    sessions_cache,
+                    path_filter=target,
+                    include_unbranched=args.all_sessions,
+                    all_projects=args.all,
+                    active_sid=active_sid,
+                    selected_sid=selected_sid if interactive else None,
+                    collapsed_sids=collapsed_sids,
+                    visible_out=visible if interactive else None,
+                    live_sids=live_sids,
+                    filter_query=filter_query,
+                )
 
         # If the selected sid vanished (e.g. its ancestor was collapsed, or it
         # no longer exists on disk), snap back to something on screen.
@@ -994,15 +1204,113 @@ def watch_loop(args):
         refresh? One tmux call, no ps/glob. Lets us react to pane switches
         well before the next interval tick without paying for a full state
         refresh on every loop iteration."""
-        pid, _ = _tmux_focused_pane(self_pane_id)
+        _, pid, _ = _tmux_focused_pane(self_pane_id)
         return pid != last_pane_pid
 
     def handle_key(key):
         """Return True if the frame needs an immediate redraw, False if no-op,
         or the string 'quit' to break the outer loop."""
-        nonlocal selected_sid, collapsed_sids
-        if key == "q" or key == "ESC":
+        nonlocal selected_sid, collapsed_sids, swap_status
+        nonlocal filter_query, filter_mode
+        nonlocal rename_mode, rename_value
+        nonlocal help_visible
+
+        # Help overlay swallows the next keypress: any key dismisses it. We
+        # don't fall through to the action — the user pressed a key to *close*
+        # help, not to fire something they couldn't see.
+        if help_visible:
+            help_visible = False
+            return True
+
+        # While editing a rename, route every key through the input handler.
+        if rename_mode:
+            if key == "ENTER":
+                if not selected_sid:
+                    rename_mode = False
+                    return True
+                title = rename_value.strip()
+                if not title:
+                    swap_status = ("rename cancelled (empty title)", time.time() + 2)
+                    rename_mode = False
+                    return True
+                if _write_custom_title(selected_sid, title):
+                    # Drop the cached entry so the next refresh re-parses and
+                    # picks up the new title without waiting for mtime drift.
+                    for p, (_, sd) in list(_SESSIONS_MTIME_CACHE.items()):
+                        if sd["sid"] == selected_sid:
+                            del _SESSIONS_MTIME_CACHE[p]
+                            break
+                    swap_status = (f"→ renamed: {title}", time.time() + 2)
+                else:
+                    swap_status = (
+                        "rename failed (jsonl not found)",
+                        time.time() + 3,
+                    )
+                rename_mode = False
+                return True
+            if key == "ESC":
+                rename_mode = False
+                return True
+            if key == "BACKSPACE":
+                rename_value = rename_value[:-1]
+                return True
+            if isinstance(key, str) and len(key) == 1 and key >= " " and key != "\x7f":
+                rename_value += key
+                return True
+            return False
+
+        # While composing a `/` query, route every key through the input
+        # handler — including 'q' / 'h' / 't' (they're literal chars, not
+        # toggles, in this mode).
+        if filter_mode:
+            if key == "ENTER":
+                filter_mode = False
+                return True
+            if key == "ESC":
+                filter_mode = False
+                filter_query = ""
+                return True
+            if key == "BACKSPACE":
+                if filter_query:
+                    filter_query = filter_query[:-1]
+                    return True
+                # Empty query + Backspace → bail out of filter mode entirely.
+                filter_mode = False
+                return True
+            if isinstance(key, str) and len(key) == 1 and key >= " " and key != "\x7f":
+                filter_query += key
+                return True
+            return False
+
+        if key == "q":
             return "quit"
+        if key == "ESC":
+            # Esc clears an active filter before quitting, so it acts like a
+            # gentle "back out" rather than always killing the sidebar.
+            if filter_query:
+                filter_query = ""
+                return True
+            return "quit"
+        if key == "?":
+            help_visible = True
+            return True
+        if key == "/":
+            filter_mode = True
+            filter_query = ""
+            return True
+        if key in ("r", "R"):
+            if selected_sid:
+                s = sessions_cache.get(selected_sid) or {}
+                # Pre-fill with the current title so tweaks are easy. Inherited
+                # titles aren't really *this* session's title, so start blank
+                # in that case rather than committing the parent's text.
+                if s.get("title") and not s.get("inherited"):
+                    rename_value = s["title"]
+                else:
+                    rename_value = ""
+                rename_mode = True
+                return True
+            return False
         if key in ("h", "H"):
             _set_show_hash(not _show_hash())
             return True
@@ -1032,6 +1340,28 @@ def watch_loop(args):
                 collapsed_sids.discard(selected_sid)
             else:
                 collapsed_sids.add(selected_sid)
+            return True
+        if key == "ENTER":
+            if not selected_sid:
+                return False
+            if selected_sid == active_sid:
+                swap_status = ("already on this session", time.time() + 2)
+                return True
+            if not last_focused_pane_id:
+                swap_status = (
+                    "no target pane (focus a non-sidebar pane first)",
+                    time.time() + 3,
+                )
+                return True
+            if _spawn_pane_swap_helper(last_focused_pane_id, selected_sid):
+                s = sessions_cache.get(selected_sid) or {}
+                label = s.get("title") or selected_sid[:8]
+                swap_status = (
+                    f"→ swap queued: {label} ({selected_sid[:8]})",
+                    time.time() + 4,
+                )
+            else:
+                swap_status = ("failed to spawn swap helper", time.time() + 3)
             return True
         return False
 
